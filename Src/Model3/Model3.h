@@ -53,7 +53,15 @@
  */
 struct FrameTimings
 {
+  // Wall time around the whole of RunMainBoardFrame, which is not the same
+  // thing as the emulated processor: the tile generator's 384 scanlines and
+  // every Real3D side effect a PowerPC store sets off happen inside it too.
+  // The two below are measured separately so that what is left really is the
+  // interpreter, and they are nanoseconds because at the millisecond
+  // resolution of the tick counter a scanline rounds away to nothing.
   UINT32 ppcTicks;
+  UINT64 tileGenNs;
+  UINT64 real3dNs;
   UINT32 syncSize;
   UINT32 syncTicks;
   UINT32 renderTicks;

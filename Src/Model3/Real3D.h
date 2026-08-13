@@ -67,6 +67,18 @@ class CReal3D: public IPCIDevice
 {
 public:
   /*
+   * ResetSideEffectTime():
+   * SideEffectTime():
+   *
+   * Nanoseconds spent this frame on work a PowerPC store set off inside this
+   * device: DMA copies and texture uploads. Both happen inside the main
+   * board's frame and would otherwise be counted as emulated processor time by
+   * anything measuring that frame from outside. See Real3D.cpp.
+   */
+  static void ResetSideEffectTime(void);
+  static uint64_t SideEffectTime(void);
+
+  /*
    * PCI IDs
    *
    * The CReal3D object must be configured with the PCI ID of the ASIC directly

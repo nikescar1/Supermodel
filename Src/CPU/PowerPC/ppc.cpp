@@ -343,16 +343,37 @@ static void ppc_change_pc(UINT32 newpc)
 static UINT8	*RAM = NULL;
 static UINT32	RAMSize = 0;
 
+static UINT8	*ROM = NULL;
+
 void ppc_attach_ram(UINT8 *ram, UINT32 size)
 {
 	RAM = ram;
 	RAMSize = (ram != NULL) ? size : 0;
 }
 
+UINT8 *ppc_direct_ram(void)
+{
+	return RAM;
+}
+
+void ppc_attach_rom(UINT8 *rom)
+{
+	ROM = rom;
+}
+
+// The fixed half of the program ROM, at 0xFF800000 and up. Read only, so
+// unlike RAM there is nothing to keep coherent, and the swizzle matches
+// CModel3::Read8/16/32 exactly. Reads only: a write there must still go to the
+// bus, which is where the banking and the ignoring live.
+#define IN_ROM(address) (ROM != NULL && (address) >= 0xFF800000)
+#define ROM_AT(address) (&ROM[(address) & 0x7FFFFF])
+
 static inline UINT8 READ8(UINT32 address)
 {
 	if (address < RAMSize)
 		return RAM[address^3];
+	if (IN_ROM(address))
+		return *(UINT8 *) ROM_AT(address^3);
 	return Bus->Read8(address);
 }
 
@@ -360,6 +381,8 @@ static inline UINT16 READ16(UINT32 address)
 {
 	if (address < RAMSize && !(address&1))
 		return *(UINT16 *) &RAM[address^2];
+	if (IN_ROM(address) && !(address&1))
+		return *(UINT16 *) ROM_AT(address^2);
 	return Bus->Read16(address);
 }
 
@@ -367,6 +390,8 @@ static inline UINT32 READ32(UINT32 address)
 {
 	if (address < RAMSize && !(address&3))
 		return *(UINT32 *) &RAM[address];
+	if (IN_ROM(address) && !(address&3))
+		return *(UINT32 *) ROM_AT(address);
 	return Bus->Read32(address);
 }
 
@@ -793,6 +818,7 @@ void ppc_init(const PPC_CONFIG *config)
 	// every access goes to the bus. A previous machine's pointer must never
 	// survive into this one.
 	ppc_attach_ram(NULL, 0);
+	ppc_attach_rom(NULL);
 
 	ppc_base_init() ;
 

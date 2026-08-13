@@ -215,6 +215,7 @@
 #include "Model3.h"
 
 #include <new>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -2045,6 +2046,8 @@ static unsigned GetCPUClockFrequencyInHz(const Game &game, Util::Config::Node &c
 void CModel3::RunMainBoardFrame(void)
 {
 	UINT32 start = CThread::GetTicks();
+	timings.tileGenNs = 0;
+	CReal3D::ResetSideEffectTime();
 
 	/* 
    * Compute display timings. Refresh rate is 57.524160 Hz and we assume frame timing is the same as System 24:
@@ -2140,11 +2143,24 @@ void CModel3::RunMainBoardFrame(void)
             IRQ.Assert(0x02);       // irq2 is asserted at the start of the last line on system24 (as apposed to the end). Lost world won't work without this, the game soft locks. We assume the same here
         }
 
-        TileGen.DrawLine(i);
+        {
+            // The tile generator fills 496 by 384 pixels a frame in scalar
+            // code, one scanline at a time between slices of PowerPC, so it
+            // lands inside the main board's time whether or not anybody meant
+            // it to. Measured on its own, because "the emulated processor is
+            // the whole frame" and "a software rasteriser is a third of the
+            // frame" are different problems with different answers.
+            auto tileStart = std::chrono::steady_clock::now();
+            TileGen.DrawLine(i);
+            timings.tileGenNs += static_cast<UINT64>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - tileStart).count());
+        }
         ppc_execute(lineCycles);
     }
 
 	timings.ppcTicks = CThread::GetTicks() - start;
+	timings.real3dNs = CReal3D::SideEffectTime();
 }
 
 void CModel3::SyncGPUs(void)
@@ -2945,6 +2961,7 @@ Result CModel3::LoadGame(const Game &game, const ROMSet &rom_set)
   // The same 8 MB the read and write handlers below special case first. Lent
   // to the interpreter so those accesses need no call at all; see ppc.cpp.
   ppc_attach_ram(ram, 0x00800000);
+  ppc_attach_rom(crom);
   PPCFetchRegions[0].start = 0;
   PPCFetchRegions[0].end = 0x007FFFFF;
   PPCFetchRegions[0].ptr = (UINT32 *) ram;

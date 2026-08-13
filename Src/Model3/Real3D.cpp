@@ -54,6 +54,7 @@
 #include "CPU/PowerPC/ppc.h"
 #include "Util/BMPFile.h"
 #include "Util/BitCast.h"
+#include <chrono>
 #include <cstring>
 #include <algorithm>
 
@@ -310,8 +311,36 @@ void CReal3D::SyncBufferedMem(UpdateBlock* updateBlock, uint32_t* updateBuffer, 
     }
 }
 
+// How long this frame's Real3D side effects took.
+//
+// A store from the emulated processor can set off a DMA copy or a texture
+// upload, and both happen inside the main board's frame, so they are counted
+// as processor time by anything that measures the frame from outside. They are
+// not: they are this device's work, and telling them apart is the difference
+// between optimising an interpreter and optimising a memcpy.
+static uint64_t s_sideEffectNs = 0;
+
+void CReal3D::ResetSideEffectTime(void) { s_sideEffectNs = 0; }
+uint64_t CReal3D::SideEffectTime(void) { return s_sideEffectNs; }
+
+namespace
+{
+  // Adds its own lifetime to the counter above.
+  struct SideEffectTimer
+  {
+    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    ~SideEffectTimer()
+    {
+      s_sideEffectNs += static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - start).count());
+    }
+  };
+}
+
 void CReal3D::FlushTextures()
 {
+  SideEffectTimer timing;
     // Upload textures (if any)
     if (fifoIdx > 2) // If the texture header/data aren't present, discard the texture (prevents garbage textures in Ski Champ)
     {
@@ -643,13 +672,27 @@ void CReal3D::UploadTexture(uint32_t header, const uint16_t *texData)
 
 void CReal3D::DMACopy(void)
 {
+  SideEffectTimer timing;
   DebugLog("Real3D DMA copy (PC=%08X, LR=%08X): %08X -> %08X, %X %s\n", ppc_get_pc(), ppc_get_lr(), dmaSrc, dmaDest, dmaLength*4, (dmaConfig&0x80)?"(byte reversed)":"");
   //printf("Real3D DMA copy (PC=%08X, LR=%08X): %08X -> %08X, %X %s\n", ppc_get_pc(), ppc_get_lr(), dmaSrc, dmaDest, dmaLength*4, (dmaConfig&0x80)?"(byte reversed)":"");
+  // The source is main RAM in every case anybody has seen, and the loop below
+  // was reading it a word at a time through a virtual call on the bus. A game
+  // that DMAs its whole display list pays that call tens of thousands of times
+  // a frame for a read that is a compare and an index. Taken directly when the
+  // whole span is provably inside RAM and aligned; anything else falls through
+  // to the original loop untouched, so nothing unusual changes behaviour.
+  const uint32_t *source = NULL;
+  if (!(dmaSrc & 3) && dmaSrc < 0x00800000 &&
+      static_cast<uint64_t>(dmaSrc) + static_cast<uint64_t>(dmaLength) * 4 <= 0x00800000)
+  {
+    source = reinterpret_cast<const uint32_t *>(ppc_direct_ram() + dmaSrc);
+  }
+
   if ((dmaConfig&0x80)) // reverse bytes
   {
     while (dmaLength != 0)
     {
-      uint32_t data = Bus->Read32(dmaSrc);
+      uint32_t data = source != NULL ? *source++ : Bus->Read32(dmaSrc);
       Bus->Write32(dmaDest, FLIPENDIAN32(data));
       dmaSrc += 4;
       dmaDest += 4;
@@ -660,7 +703,7 @@ void CReal3D::DMACopy(void)
   {
     while (dmaLength != 0)
     {
-      Bus->Write32(dmaDest, Bus->Read32(dmaSrc));
+      Bus->Write32(dmaDest, source != NULL ? *source++ : Bus->Read32(dmaSrc));
       dmaSrc += 4;
       dmaDest += 4;
       --dmaLength;

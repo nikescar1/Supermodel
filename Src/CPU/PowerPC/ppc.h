@@ -369,6 +369,16 @@ extern void ppc_attach_bus(class IBus *BusPtr);		// must be called first!
 // bytes and the region must start at address zero. NULL withdraws it, which is
 // what a machine with no such region gets. See ppc.cpp.
 extern void ppc_attach_ram(UINT8 *ram, UINT32 size);
+
+// The region lent above, or NULL. For a device that copies out of main RAM in
+// bulk and would otherwise go through the bus one word at a time.
+extern UINT8 *ppc_direct_ram(void);
+
+// The fixed program ROM, lent on the same terms as RAM: read only, never moved,
+// and stored with each aligned word already byte reversed, so the swizzle is
+// identical. Games read constant pools, jump tables and model data straight out
+// of it and every one of those was a virtual call.
+extern void ppc_attach_rom(UINT8 *rom);
 extern void ppc_save_state(class CBlockFile *SaveState);
 extern void ppc_load_state(class CBlockFile *SaveState);
 extern UINT32 ppc_get_gpr(unsigned num);
