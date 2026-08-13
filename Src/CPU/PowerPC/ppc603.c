@@ -282,7 +282,22 @@ int ppc_execute(int cycles)
 		PPCDebug->CPUActive();
 #endif // SUPERMODEL_DEBUGGER
 
-	while( ppc.icount > 0 && !ppc.fatalError)
+	// Two loops rather than one.
+	//
+	// The decrementer fires at a particular count, and testing for that inside
+	// the loop cost a load, a compare and a branch on every emulated
+	// instruction to catch something that happens at most once a slice. The
+	// outer loop works out the count to stop at and the inner one runs down to
+	// it, so the test happens once instead of a few million times. Anything
+	// that moves the decrementer mid-slice sends the inner loop back out; see
+	// write_decrementer.
+	while (ppc.icount > 0 && !ppc.fatalError)
+	{
+	ppc.icount_stop = (ppc.dec_trigger_cycle > 0 &&
+	                   ppc.dec_trigger_cycle < ppc.icount)
+	                ? ppc.dec_trigger_cycle : 0;
+
+	while( ppc.icount > ppc.icount_stop && !ppc.fatalError)
 	{
 		ppc.pc = ppc.npc;
 		
@@ -316,14 +331,13 @@ int ppc_execute(int cycles)
 		}
 
 		ppc.icount--;
-		
+	}
+
 		if (ppc.icount == ppc.dec_trigger_cycle)
 		{
 			ppc.interrupt_pending |= 0x2;
 			ppc603_check_interrupts();
 		}
-
-		//ppc603_check_interrupts();
 	}
 
 #ifdef SUPERMODEL_DEBUGGER

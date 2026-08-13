@@ -258,6 +258,10 @@ typedef struct {
 	int tb_base_icount;
 	int dec_base_icount;
 	int dec_trigger_cycle;
+	// The count the inner interpreter loop runs down to. Zero unless the
+	// decrementer is due to fire inside this slice, in which case it is the
+	// count at which that happens. See ppc603_execute.
+	int icount_stop;
 	
 	// Cycle related
 	UINT64 total_cycles;
@@ -343,6 +347,36 @@ static void ppc_change_pc(UINT32 newpc)
 static UINT8	*RAM = NULL;
 static UINT32	RAMSize = 0;
 
+// Which way these tests almost always go.
+//
+// Every one of them is "is this address ordinary memory", and it nearly always
+// is: the exceptions are the memory mapped registers, and a game touches those
+// a few thousand times a frame against a few hundred thousand ordinary loads
+// and stores. Saying so lets the compiler put the ordinary case in a straight
+// line and push the call to the bus out of the way of it, which is worth more
+// than the branch prediction: a call in the middle of a hot path forces every
+// live register around it onto the stack.
+#if defined(__GNUC__) || defined(__clang__)
+#define PPC_LIKELY(x)	__builtin_expect(!!(x), 1)
+#else
+#define PPC_LIKELY(x)	(x)
+#endif
+
+// Keeps a load's slow half out of its fast half.
+//
+// A load has to put the result somewhere after the read, so unlike a store
+// it cannot simply hand the address to the bus and return. That leaves the
+// destination register live across the call, and the compiler answers by
+// building a stack frame and spilling four registers into it, on every load,
+// including the overwhelming majority that never leave RAM. Splitting the
+// two halves means the fast one is a leaf with no frame at all and the slow
+// one is reached by a tail call, which needs no frame either.
+#if defined(__GNUC__) || defined(__clang__)
+#define PPC_NOINLINE	__attribute__((noinline))
+#else
+#define PPC_NOINLINE	__declspec(noinline)
+#endif
+
 static UINT8	*ROM = NULL;
 
 void ppc_attach_ram(UINT8 *ram, UINT32 size)
@@ -370,7 +404,7 @@ void ppc_attach_rom(UINT8 *rom)
 
 static inline UINT8 READ8(UINT32 address)
 {
-	if (address < RAMSize)
+	if (PPC_LIKELY(address < RAMSize))
 		return RAM[address^3];
 	if (IN_ROM(address))
 		return *(UINT8 *) ROM_AT(address^3);
@@ -379,7 +413,7 @@ static inline UINT8 READ8(UINT32 address)
 
 static inline UINT16 READ16(UINT32 address)
 {
-	if (address < RAMSize && !(address&1))
+	if (PPC_LIKELY(address < RAMSize && !(address&1)))
 		return *(UINT16 *) &RAM[address^2];
 	if (IN_ROM(address) && !(address&1))
 		return *(UINT16 *) ROM_AT(address^2);
@@ -388,7 +422,7 @@ static inline UINT16 READ16(UINT32 address)
 
 static inline UINT32 READ32(UINT32 address)
 {
-	if (address < RAMSize && !(address&3))
+	if (PPC_LIKELY(address < RAMSize && !(address&3)))
 		return *(UINT32 *) &RAM[address];
 	if (IN_ROM(address) && !(address&3))
 		return *(UINT32 *) ROM_AT(address);
@@ -411,7 +445,7 @@ static inline UINT64 READ64(UINT32 address)
 
 static inline void WRITE8(UINT32 address, UINT8 data)
 {
-	if (address < RAMSize)
+	if (PPC_LIKELY(address < RAMSize))
 	{
 		RAM[address^3] = data;
 		return;
@@ -421,7 +455,7 @@ static inline void WRITE8(UINT32 address, UINT8 data)
 
 static inline void WRITE16(UINT32 address, UINT16 data)
 {
-	if (address < RAMSize && !(address&1))
+	if (PPC_LIKELY(address < RAMSize && !(address&1)))
 	{
 		*(UINT16 *) &RAM[address^2] = data;
 		return;
@@ -431,7 +465,7 @@ static inline void WRITE16(UINT32 address, UINT16 data)
 
 static inline void WRITE32(UINT32 address, UINT32 data)
 {
-	if (address < RAMSize && !(address&3))
+	if (PPC_LIKELY(address < RAMSize && !(address&3)))
 	{
 		*(UINT32 *) &RAM[address] = data;
 		return;
@@ -574,6 +608,12 @@ static inline void write_decrementer(UINT32 value)
 		ppc.dec_trigger_cycle = ppc.dec_base_icount - ((1 + DEC) * ppc.timer_ratio);
 	else
 		ppc.dec_trigger_cycle = 0x7fffffff;
+
+	// The inner loop is comparing against a floor worked out before this ran,
+	// so it has to be sent back out to work it out again. Setting the floor to
+	// where the count already is ends the loop on its next test without any
+	// other effect.
+	ppc.icount_stop = ppc.icount;
 }
 
 /*********************************************************************/

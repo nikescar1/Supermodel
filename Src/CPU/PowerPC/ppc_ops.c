@@ -597,6 +597,11 @@ static void ppc_isync(UINT32 op)
 
 }
 
+static PPC_NOINLINE void ppc_lbz_slow(UINT32 op, UINT32 ea)
+{
+	REG(RT) = (UINT32)READ8(ea);
+}
+
 static void ppc_lbz(UINT32 op)
 {
 	UINT32 ea = SIMM16;
@@ -604,13 +609,35 @@ static void ppc_lbz(UINT32 op)
 	if( RA != 0 )
 		ea += REG(RA);
 
+	if (PPC_LIKELY(ea < RAMSize))
+	{
+		REG(RT) = (UINT32)RAM[ea^3];
+		return;
+	}
+	ppc_lbz_slow(op, ea);
+}
+
+static PPC_NOINLINE void ppc_lbzu_slow(UINT32 op, UINT32 ea)
+{
 	REG(RT) = (UINT32)READ8(ea);
+	REG(RA) = ea;
 }
 
 static void ppc_lbzu(UINT32 op)
 {
 	UINT32 ea = REG(RA) + SIMM16;
 
+	if (PPC_LIKELY(ea < RAMSize))
+	{
+		REG(RT) = (UINT32)RAM[ea^3];
+		REG(RA) = ea;
+		return;
+	}
+	ppc_lbzu_slow(op, ea);
+}
+
+static PPC_NOINLINE void ppc_lbzux_slow(UINT32 op, UINT32 ea)
+{
 	REG(RT) = (UINT32)READ8(ea);
 	REG(RA) = ea;
 }
@@ -619,8 +646,18 @@ static void ppc_lbzux(UINT32 op)
 {
 	UINT32 ea = REG(RA) + REG(RB);
 
+	if (PPC_LIKELY(ea < RAMSize))
+	{
+		REG(RT) = (UINT32)RAM[ea^3];
+		REG(RA) = ea;
+		return;
+	}
+	ppc_lbzux_slow(op, ea);
+}
+
+static PPC_NOINLINE void ppc_lbzx_slow(UINT32 op, UINT32 ea)
+{
 	REG(RT) = (UINT32)READ8(ea);
-	REG(RA) = ea;
 }
 
 static void ppc_lbzx(UINT32 op)
@@ -630,7 +667,17 @@ static void ppc_lbzx(UINT32 op)
 	if( RA != 0 )
 		ea += REG(RA);
 
-	REG(RT) = (UINT32)READ8(ea);
+	if (PPC_LIKELY(ea < RAMSize))
+	{
+		REG(RT) = (UINT32)RAM[ea^3];
+		return;
+	}
+	ppc_lbzx_slow(op, ea);
+}
+
+static PPC_NOINLINE void ppc_lha_slow(UINT32 op, UINT32 ea)
+{
+	REG(RT) = (INT32)(INT16)READ16(ea);
 }
 
 static void ppc_lha(UINT32 op)
@@ -640,13 +687,35 @@ static void ppc_lha(UINT32 op)
 	if( RA != 0 )
 		ea += REG(RA);
 
+	if (PPC_LIKELY(ea < RAMSize && !(ea&1)))
+	{
+		REG(RT) = (INT32)(INT16)*(UINT16 *) &RAM[ea^2];
+		return;
+	}
+	ppc_lha_slow(op, ea);
+}
+
+static PPC_NOINLINE void ppc_lhau_slow(UINT32 op, UINT32 ea)
+{
 	REG(RT) = (INT32)(INT16)READ16(ea);
+	REG(RA) = ea;
 }
 
 static void ppc_lhau(UINT32 op)
 {
 	UINT32 ea = REG(RA) + SIMM16;
 
+	if (PPC_LIKELY(ea < RAMSize && !(ea&1)))
+	{
+		REG(RT) = (INT32)(INT16)*(UINT16 *) &RAM[ea^2];
+		REG(RA) = ea;
+		return;
+	}
+	ppc_lhau_slow(op, ea);
+}
+
+static PPC_NOINLINE void ppc_lhaux_slow(UINT32 op, UINT32 ea)
+{
 	REG(RT) = (INT32)(INT16)READ16(ea);
 	REG(RA) = ea;
 }
@@ -655,8 +724,18 @@ static void ppc_lhaux(UINT32 op)
 {
 	UINT32 ea = REG(RA) + REG(RB);
 
+	if (PPC_LIKELY(ea < RAMSize && !(ea&1)))
+	{
+		REG(RT) = (INT32)(INT16)*(UINT16 *) &RAM[ea^2];
+		REG(RA) = ea;
+		return;
+	}
+	ppc_lhaux_slow(op, ea);
+}
+
+static PPC_NOINLINE void ppc_lhax_slow(UINT32 op, UINT32 ea)
+{
 	REG(RT) = (INT32)(INT16)READ16(ea);
-	REG(RA) = ea;
 }
 
 static void ppc_lhax(UINT32 op)
@@ -666,7 +745,12 @@ static void ppc_lhax(UINT32 op)
 	if( RA != 0 )
 		ea += REG(RA);
 
-	REG(RT) = (INT32)(INT16)READ16(ea);
+	if (PPC_LIKELY(ea < RAMSize && !(ea&1)))
+	{
+		REG(RT) = (INT32)(INT16)*(UINT16 *) &RAM[ea^2];
+		return;
+	}
+	ppc_lhax_slow(op, ea);
 }
 
 static void ppc_lhbrx(UINT32 op)
@@ -681,6 +765,11 @@ static void ppc_lhbrx(UINT32 op)
 	REG(RT) = (UINT32)BYTE_REVERSE16(w);
 }
 
+static PPC_NOINLINE void ppc_lhz_slow(UINT32 op, UINT32 ea)
+{
+	REG(RT) = (UINT32)READ16(ea);
+}
+
 static void ppc_lhz(UINT32 op)
 {
 	UINT32 ea = SIMM16;
@@ -688,13 +777,35 @@ static void ppc_lhz(UINT32 op)
 	if( RA != 0 )
 		ea += REG(RA);
 
+	if (PPC_LIKELY(ea < RAMSize && !(ea&1)))
+	{
+		REG(RT) = (UINT32)*(UINT16 *) &RAM[ea^2];
+		return;
+	}
+	ppc_lhz_slow(op, ea);
+}
+
+static PPC_NOINLINE void ppc_lhzu_slow(UINT32 op, UINT32 ea)
+{
 	REG(RT) = (UINT32)READ16(ea);
+	REG(RA) = ea;
 }
 
 static void ppc_lhzu(UINT32 op)
 {
 	UINT32 ea = REG(RA) + SIMM16;
 
+	if (PPC_LIKELY(ea < RAMSize && !(ea&1)))
+	{
+		REG(RT) = (UINT32)*(UINT16 *) &RAM[ea^2];
+		REG(RA) = ea;
+		return;
+	}
+	ppc_lhzu_slow(op, ea);
+}
+
+static PPC_NOINLINE void ppc_lhzux_slow(UINT32 op, UINT32 ea)
+{
 	REG(RT) = (UINT32)READ16(ea);
 	REG(RA) = ea;
 }
@@ -703,8 +814,18 @@ static void ppc_lhzux(UINT32 op)
 {
 	UINT32 ea = REG(RA) + REG(RB);
 
+	if (PPC_LIKELY(ea < RAMSize && !(ea&1)))
+	{
+		REG(RT) = (UINT32)*(UINT16 *) &RAM[ea^2];
+		REG(RA) = ea;
+		return;
+	}
+	ppc_lhzux_slow(op, ea);
+}
+
+static PPC_NOINLINE void ppc_lhzx_slow(UINT32 op, UINT32 ea)
+{
 	REG(RT) = (UINT32)READ16(ea);
-	REG(RA) = ea;
 }
 
 static void ppc_lhzx(UINT32 op)
@@ -714,7 +835,12 @@ static void ppc_lhzx(UINT32 op)
 	if( RA != 0 )
 		ea += REG(RA);
 
-	REG(RT) = (UINT32)READ16(ea);
+	if (PPC_LIKELY(ea < RAMSize && !(ea&1)))
+	{
+		REG(RT) = (UINT32)*(UINT16 *) &RAM[ea^2];
+		return;
+	}
+	ppc_lhzx_slow(op, ea);
 }
 
 static void ppc_lmw(UINT32 op)
@@ -812,6 +938,11 @@ static void ppc_lwbrx(UINT32 op)
 	REG(RT) = BYTE_REVERSE32(w);
 }
 
+static PPC_NOINLINE void ppc_lwz_slow(UINT32 op, UINT32 ea)
+{
+	REG(RT) = READ32(ea);
+}
+
 static void ppc_lwz(UINT32 op)
 {
 	UINT32 ea = SIMM16;
@@ -819,13 +950,35 @@ static void ppc_lwz(UINT32 op)
 	if( RA != 0 )
 		ea += REG(RA);
 
+	if (PPC_LIKELY(ea < RAMSize && !(ea&3)))
+	{
+		REG(RT) = *(UINT32 *) &RAM[ea];
+		return;
+	}
+	ppc_lwz_slow(op, ea);
+}
+
+static PPC_NOINLINE void ppc_lwzu_slow(UINT32 op, UINT32 ea)
+{
 	REG(RT) = READ32(ea);
+	REG(RA) = ea;
 }
 
 static void ppc_lwzu(UINT32 op)
 {
 	UINT32 ea = REG(RA) + SIMM16;
 
+	if (PPC_LIKELY(ea < RAMSize && !(ea&3)))
+	{
+		REG(RT) = *(UINT32 *) &RAM[ea];
+		REG(RA) = ea;
+		return;
+	}
+	ppc_lwzu_slow(op, ea);
+}
+
+static PPC_NOINLINE void ppc_lwzux_slow(UINT32 op, UINT32 ea)
+{
 	REG(RT) = READ32(ea);
 	REG(RA) = ea;
 }
@@ -834,8 +987,18 @@ static void ppc_lwzux(UINT32 op)
 {
 	UINT32 ea = REG(RA) + REG(RB);
 
+	if (PPC_LIKELY(ea < RAMSize && !(ea&3)))
+	{
+		REG(RT) = *(UINT32 *) &RAM[ea];
+		REG(RA) = ea;
+		return;
+	}
+	ppc_lwzux_slow(op, ea);
+}
+
+static PPC_NOINLINE void ppc_lwzx_slow(UINT32 op, UINT32 ea)
+{
 	REG(RT) = READ32(ea);
-	REG(RA) = ea;
 }
 
 static void ppc_lwzx(UINT32 op)
@@ -845,7 +1008,12 @@ static void ppc_lwzx(UINT32 op)
 	if( RA != 0 )
 		ea += REG(RA);
 
-	REG(RT) = READ32(ea);
+	if (PPC_LIKELY(ea < RAMSize && !(ea&3)))
+	{
+		REG(RT) = *(UINT32 *) &RAM[ea];
+		return;
+	}
+	ppc_lwzx_slow(op, ea);
 }
 
 static void ppc_mcrf(UINT32 op)
