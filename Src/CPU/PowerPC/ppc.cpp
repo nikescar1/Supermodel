@@ -281,6 +281,14 @@ typedef struct {
 	// See the cache itself, further down; the name avoids the decrementer
 	// register, which got there first.
 	void (**dec_cursor)(UINT32);
+
+	// What the idle detector saw last time it was asked. See ppc_note_spin.
+	UINT32 spin_pc;
+	int spin_icount;
+	UINT64 spin_bus;
+	// How many instructions have been skipped rather than executed, and how
+	// many were executed, so the two can be reported against each other.
+	UINT64 spin_skipped;
 	
 	// Cycle related
 	UINT64 total_cycles;
@@ -417,6 +425,31 @@ static UINT32	RAMSize = 0;
 #define PPC_NOINLINE	__declspec(noinline)
 #endif
 
+// How many accesses have gone somewhere other than RAM or the program ROM.
+//
+// Not part of the processor's state and not saved with it: it exists so that
+// the idle detector further down can tell a loop reading a device register,
+// whose value changes on its own, from one reading ordinary memory, which
+// cannot change while the processor is the only thing running.
+static UINT64	BusTouches = 0;
+
+// Whether waiting loops may be skipped rather than executed. On by default and
+// switchable because the argument for it, sound as it looks, is an argument
+// about what a game can and cannot do rather than a measurement of what it
+// does; a game that misbehaves needs a way back without a new build.
+static bool	IdleSkip = true;
+
+void ppc_set_idle_skip(bool enabled)
+{
+	IdleSkip = enabled;
+}
+
+// The longest waiting loop worth recognising, in instructions. Long enough for
+// a poll that masks a bit before comparing it, short enough that walking the
+// body costs nothing. See ppc_spin_loop, and ppc_invalidate_window, which has
+// to reach as far.
+#define PPC_SPIN_MAX	8
+
 static UINT8	*ROM = NULL;
 
 /*
@@ -482,10 +515,26 @@ static UINT32		CodePageMask = 0;
 // Puts the stub back for the word containing `address`, so the next execution
 // of it decodes again. Callers have already established that the address is
 // inside RAM.
+// The word written and the few after it.
+//
+// One entry would be enough if every entry described only its own word, but a
+// branch that closes a waiting loop holds a decision made by reading the
+// instructions in front of it, and those are at most PPC_SPIN_MAX words back.
+// So writing one of them has to throw the branch away as well. Outlined
+// because the caller's fast path is the test above it, not this.
+static PPC_NOINLINE void ppc_invalidate_window(UINT32 first)
+{
+	UINT32 last = first + PPC_SPIN_MAX;
+	if (last >= DecEntries)
+		last = DecEntries - 1;
+	for (UINT32 i = first; i <= last; i++)
+		Dec[i] = ppc_decode_stub;
+}
+
 static inline void ppc_invalidate(UINT32 address)
 {
 	if (PPC_UNLIKELY(CodePage[(address >> 12) & CodePageMask] != 0))
-		Dec[address >> 2] = ppc_decode_stub;
+		ppc_invalidate_window(address >> 2);
 }
 
 // Notes that the word at `address` has been decoded, so stores to its page
@@ -594,6 +643,7 @@ static inline UINT8 READ8(UINT32 address)
 		return RAM[address^3];
 	if (IN_ROM(address))
 		return *(UINT8 *) ROM_AT(address^3);
+	BusTouches++;
 	return Bus->Read8(address);
 }
 
@@ -603,6 +653,7 @@ static inline UINT16 READ16(UINT32 address)
 		return *(UINT16 *) &RAM[address^2];
 	if (IN_ROM(address) && !(address&1))
 		return *(UINT16 *) ROM_AT(address^2);
+	BusTouches++;
 	return Bus->Read16(address);
 }
 
@@ -612,6 +663,7 @@ static inline UINT32 READ32(UINT32 address)
 		return *(UINT32 *) &RAM[address];
 	if (IN_ROM(address) && !(address&3))
 		return *(UINT32 *) ROM_AT(address);
+	BusTouches++;
 	return Bus->Read32(address);
 }
 
@@ -626,6 +678,7 @@ static inline UINT64 READ64(UINT32 address)
 		data |= *(UINT32 *) &RAM[address+4];
 		return data;
 	}
+	BusTouches++;
 	return Bus->Read64(address);
 }
 
@@ -637,6 +690,7 @@ static inline void WRITE8(UINT32 address, UINT8 data)
 		ppc_invalidate(address);
 		return;
 	}
+	BusTouches++;
 	Bus->Write8(address,data);
 }
 
@@ -648,6 +702,7 @@ static inline void WRITE16(UINT32 address, UINT16 data)
 		ppc_invalidate(address);
 		return;
 	}
+	BusTouches++;
 	Bus->Write16(address,data);
 }
 
@@ -659,6 +714,7 @@ static inline void WRITE32(UINT32 address, UINT32 data)
 		ppc_invalidate(address);
 		return;
 	}
+	BusTouches++;
 	Bus->Write32(address,data);
 }
 
@@ -672,6 +728,7 @@ static inline void WRITE64(UINT32 address, UINT64 data)
 		ppc_invalidate(address+4);
 		return;
 	}
+	BusTouches++;
 	Bus->Write64(address,data);
 }
 
@@ -1002,15 +1059,218 @@ static inline void ppc_sample_opcode(UINT32 opcode)
 		OpHist31[(opcode >> 1) & 0x3ff]++;
 }
 
-void ppc_op_histogram(const UINT32 **primary, const UINT32 **ext31)
+// Copied out and then cleared, so each report describes the interval since the
+// last one. Running totals were worse than useless here: a game spends its
+// first few seconds booting, and once those samples are in the denominator
+// they hold the figures away from what the game is doing now for the rest of
+// the session.
+void ppc_op_histogram(UINT32 *primary, UINT32 *ext31)
 {
-	*primary = OpHist;
-	*ext31 = OpHist31;
+	memcpy(primary, OpHist, sizeof(OpHist));
+	memcpy(ext31, OpHist31, sizeof(OpHist31));
+	memset(OpHist, 0, sizeof(OpHist));
+	memset(OpHist31, 0, sizeof(OpHist31));
+}
+
+/*
+ * Loops that only wait.
+ *
+ * A game spends most of its emulated cycles doing nothing. It finishes the
+ * work for a frame and then sits reading a word of memory over and over until
+ * an interrupt handler changes it, and on this hardware that is not a small
+ * share of the time: measured over a run of L.A. Machineguns, ninety-two
+ * percent of everything executed was a load, a compare and a branch backwards,
+ * with almost no arithmetic and almost no stores between them. Emulating that
+ * faster is emulating waiting faster.
+ *
+ * It can be skipped outright rather than approximated, because of how the main
+ * board is driven. CModel3::RunMainBoardFrame runs the processor in four
+ * hundred and twenty-four slices a frame and services every device between
+ * them, so within one slice nothing outside the processor moves. If a loop
+ * cannot end without something outside changing, and nothing outside can
+ * change until the slice does, then the loop runs to the end of the slice and
+ * the only question is whether the cycles are spent finding that out.
+ *
+ * Proving a loop is that kind takes two halves. This half is static and runs
+ * once, when the branch is decoded: the body has to be short, and it has to
+ * hold nothing but loads, compares and register logic, with no stores, no
+ * branches and nothing that reaches a special register. On top of that, every
+ * register the body reads and also writes must be written before it is read,
+ * which makes the body a function of registers it does not touch and of memory
+ * alone. That last rule is what excludes a loop counting down to a timeout:
+ * such a loop reads the counter it wrote last time round, so it is not the
+ * same loop twice and it will end on its own.
+ *
+ * The other half is at run time, and is in ppc_note_spin.
+ */
+
+// Whether one instruction may appear in the body of a waiting loop, and which
+// registers it reads and writes if it may.
+static bool ppc_spin_fields(UINT32 op, UINT32 *reads, UINT32 *writes)
+{
+	const UINT32 primary = op >> 26;
+	const UINT32 ra = (op >> 16) & 0x1f;
+	const UINT32 rs = (op >> 21) & 0x1f;	// also RT, and RD
+	const UINT32 rb = (op >> 11) & 0x1f;
+
+	*reads = 0;
+	*writes = 0;
+
+	switch (primary)
+	{
+		// The D-form loads, whose destination is the field at 21 and whose
+		// base is the one at 16. A base of zero means no base, not r0. The
+		// update forms are absent on purpose: they write the base as well,
+		// which is exactly the thing this is trying to rule out.
+		case 32: case 34: case 40: case 42:
+			*reads = (ra != 0) ? (1u << ra) : 0;
+			*writes = 1u << rs;
+			return true;
+
+		// Compares against an immediate. These write a condition field and no
+		// register at all, and a condition field is only ever read by the
+		// branch that ends the loop.
+		case 10: case 11:
+			*reads = 1u << ra;
+			return true;
+
+		// The D-form logicals and the rotate, whose destination is at 16 and
+		// whose source is at 21. The other way round from a load, which is
+		// worth saying because getting it backwards would let a loop through
+		// that writes what it reads.
+		case 21: case 24: case 25: case 26: case 27: case 28: case 29:
+			*reads = 1u << rs;
+			*writes = 1u << ra;
+			return true;
+
+		case 31:
+			switch ((op >> 1) & 0x3ff)
+			{
+				// Compares.
+				case 0: case 32:
+					*reads = (1u << ra) | (1u << rb);
+					return true;
+
+				// The indexed loads.
+				case 23: case 87: case 279: case 343:
+					*reads = ((ra != 0) ? (1u << ra) : 0) | (1u << rb);
+					*writes = 1u << rs;
+					return true;
+
+				// Register to register logic and shifts: and, andc, nor, or,
+				// orc, xor, nand, slw, srw, sraw.
+				case 28: case 60: case 124: case 284: case 412: case 444:
+				case 476: case 24: case 536: case 792:
+					*reads = (1u << rs) | (1u << rb);
+					*writes = 1u << ra;
+					return true;
+
+				// The ones with no second register: srawi, extsh, extsb,
+				// cntlzw.
+				case 824: case 922: case 954: case 26:
+					*reads = 1u << rs;
+					*writes = 1u << ra;
+					return true;
+			}
+			return false;
+	}
+	return false;
+}
+
+// Whether the conditional branch at `address` closes a loop that can only be
+// ended from outside. See above.
+static bool ppc_spin_loop(UINT32 op, UINT32 address)
+{
+	const INT32 displacement = (INT32)(INT16)(op & 0xffff) & ~0x3;
+
+	// Backwards, and to somewhere this can read.
+	if (displacement >= 0 || displacement < -(PPC_SPIN_MAX * 4))
+		return false;
+	const UINT32 span = (UINT32) (-displacement) >> 2;
+	const UINT32 target = address + (UINT32) displacement;
+	if (target >= address || address >= RAMSize)
+		return false;
+
+	// The body is the `span` instructions from the target up to the branch,
+	// which sits at target + span * 4, where this started. Read straight out
+	// of RAM: Supermodel keeps it in the order the interpreter fetches it.
+	UINT32 reads[PPC_SPIN_MAX];
+	UINT32 writes[PPC_SPIN_MAX];
+	UINT32 clobbered = 0;
+	for (UINT32 i = 0; i < span; i++)
+	{
+		UINT32 word = *(UINT32 *) &RAM[target + i * 4];
+		if (!ppc_spin_fields(word, &reads[i], &writes[i]))
+			return false;
+		clobbered |= writes[i];
+	}
+
+	// Nothing may read a register the body writes before the body has written
+	// it. That is what makes every pass round the loop identical.
+	UINT32 written = 0;
+	for (UINT32 i = 0; i < span; i++)
+	{
+		if (reads[i] & clobbered & ~written)
+			return false;
+		written |= writes[i];
+	}
+	return true;
+}
+
+/*
+ * The run-time half of proving a loop is waiting.
+ *
+ * Called from the branch that closes a loop the analysis above accepted, on
+ * the path where the branch is taken, so the loop is about to go round again.
+ * Three things have to hold against the last time this same branch was taken:
+ * it must be the same branch, exactly the loop's own length of instructions
+ * must have been executed since, and nothing must have gone outside RAM. The
+ * count is what rules out an interrupt having run and changed something in the
+ * meantime; the bus check is what rules out the loop reading a device register
+ * whose value moves on its own, or whose reading has an effect.
+ *
+ * When all three hold, the loop is reading memory that nothing can change
+ * before the slice ends, so the rest of the slice is handed to the clock
+ * rather than executed. The timebase and the decrementer are worked out from
+ * the count at the end of ppc_execute, so time passes exactly as it would
+ * have; the instructions simply do not.
+ *
+ * The stop is one above the count the loop is running down to, because the
+ * loop decrements once more before testing.
+ */
+static inline void ppc_note_spin(UINT32 op)
+{
+	const UINT32 span = (UINT32) (-(((INT32)(INT16)(op & 0xffff)) & ~0x3)) >> 2;
+
+	// The body and the branch itself, which is why it is one more than the
+	// distance the branch jumps.
+	if (ppc.spin_pc == ppc.pc &&
+	    ppc.spin_bus == BusTouches &&
+	    (UINT32) (ppc.spin_icount - ppc.icount) == span + 1 &&
+	    ppc.icount > ppc.icount_stop + 1)
+	{
+		ppc.spin_skipped += (UINT64) (ppc.icount - (ppc.icount_stop + 1));
+		ppc.icount = ppc.icount_stop + 1;
+	}
+
+	ppc.spin_pc = ppc.pc;
+	ppc.spin_icount = ppc.icount;
+	ppc.spin_bus = BusTouches;
+}
+
+// How many instructions were skipped rather than executed. Against the two
+// dispatch counts, this says how much of the emulated processor's time was
+// spent waiting.
+void ppc_idle_skipped(UINT64 *skipped)
+{
+	*skipped = ppc.spin_skipped;
 }
 
 // The branch shapes that are worth a handler of their own. See ppc_ops.c.
 static void ppc_bc_true(UINT32 op);
 static void ppc_bc_false(UINT32 op);
+static void ppc_bc_true_idle(UINT32 op);
+static void ppc_bc_false_idle(UINT32 op);
 static void ppc_blr(UINT32 op);
 static void ppc_bctr(UINT32 op);
 
@@ -1054,10 +1314,20 @@ static void ppc_decode_stub(UINT32 op)
 	PPCHandler handler = ppc_decode(op);
 	// The loop has already stepped past this entry, so it is the one behind.
 	PPCHandler *entry = ppc.dec_cursor - 1;
+	const UINT32 address = (UINT32) (entry - Dec) << 2;
+
+	// Whether this branch closes a loop that only waits. The walk over the
+	// body is not cheap, which is exactly why it belongs here: once, when the
+	// instruction is first seen, rather than every time it runs.
+	if (IdleSkip && handler == ppc_bc_true && ppc_spin_loop(op, address))
+		handler = ppc_bc_true_idle;
+	else if (IdleSkip && handler == ppc_bc_false && ppc_spin_loop(op, address))
+		handler = ppc_bc_false_idle;
+
 	*entry = handler;
 	// This page holds code, so stores to it have something to invalidate from
 	// here on. Four bytes an entry, four kilobytes a page.
-	ppc_note_code((UINT32) (entry - Dec) << 2);
+	ppc_note_code(address);
 	handler(op);
 }
 

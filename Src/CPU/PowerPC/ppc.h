@@ -378,10 +378,21 @@ extern UINT8 *ppc_direct_ram(void);
 // fallback that works each handler out. See the fields in ppc.cpp.
 extern void ppc_dec_mix(UINT64 *cached, UINT64 *uncached);
 
-// A sampled count of executed instructions, by primary opcode (64 entries)
-// and by extended opcode within the integer group (1024). Instrumentation to
-// aim what is done to the interpreter next; see OpHist in ppc.cpp.
-extern void ppc_op_histogram(const UINT32 **primary, const UINT32 **ext31);
+// A sampled count of executed instructions, by primary opcode and by extended
+// opcode within the integer group. The caller provides the two arrays, of 64
+// and 1024 entries; they are filled in and the counts start again, so each
+// call describes the interval since the last. See OpHist in ppc.cpp.
+extern void ppc_op_histogram(UINT32 *primary, UINT32 *ext31);
+
+// Whether a loop that can only be ended from outside may be skipped to the end
+// of its slice rather than executed. On unless turned off. Takes effect on the
+// next instruction decoded, so it is meant to be set before a game runs.
+extern void ppc_set_idle_skip(bool enabled);
+
+// How many instructions were skipped rather than executed, because the
+// processor was in a loop that could not end before its slice did. See
+// ppc_note_spin in ppc.cpp.
+extern void ppc_idle_skipped(UINT64 *skipped);
 
 // Throws away every decoded instruction. For anything that replaces the
 // contents of main RAM behind the interpreter's back, which is a save state

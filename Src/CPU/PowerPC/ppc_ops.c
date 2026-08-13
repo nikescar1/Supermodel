@@ -297,6 +297,29 @@ static void ppc_bc_false(UINT32 op)
 	}
 }
 
+// The same two again, for loops that were shown at decode time to be waiting
+// rather than working. Identical but for the one call, which is what decides
+// whether the rest of the slice is executed or handed to the clock.
+static void ppc_bc_true_idle(UINT32 op)
+{
+	if (CRBIT(BI))
+	{
+		ppc_note_spin(op);
+		ppc.npc = (SIMM16 & ~0x3) + ppc.pc;
+		ppc_change_pc(ppc.npc);
+	}
+}
+
+static void ppc_bc_false_idle(UINT32 op)
+{
+	if (!CRBIT(BI))
+	{
+		ppc_note_spin(op);
+		ppc.npc = (SIMM16 & ~0x3) + ppc.pc;
+		ppc_change_pc(ppc.npc);
+	}
+}
+
 // bclr with BO=10100 and no link, which is how every function returns.
 static void ppc_blr(UINT32 op)
 {
