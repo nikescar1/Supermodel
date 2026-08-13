@@ -374,9 +374,19 @@ extern void ppc_attach_ram(UINT8 *ram, UINT32 size);
 // bulk and would otherwise go through the bus one word at a time.
 extern UINT8 *ppc_direct_ram(void);
 
-// How the executed instructions divide between the program ROM and RAM, as
-// sample counts rather than totals. See the fields in ppc.cpp.
-extern void ppc_fetch_mix(UINT64 *rom, UINT64 *ram);
+// How the executed instructions divide between the decoded cache and the
+// fallback that works each handler out. See the fields in ppc.cpp.
+extern void ppc_dec_mix(UINT64 *cached, UINT64 *uncached);
+
+// Throws away every decoded instruction. For anything that replaces the
+// contents of main RAM behind the interpreter's back, which is a save state
+// being loaded and nothing else so far. Writes made through the bus invalidate
+// themselves; see ppc.cpp.
+extern void ppc_invalidate_all(void);
+
+// Invalidates the decoded instruction covering one address. For a device that
+// writes main RAM without going through the interpreter.
+extern void ppc_invalidate_word(UINT32 address);
 
 // The fixed program ROM, lent on the same terms as RAM: read only, never moved,
 // and stored with each aligned word already byte reversed, so the swizzle is

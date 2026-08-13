@@ -252,6 +252,9 @@ void ppc_reset(void)
 int ppc_execute(int cycles)
 {
 	UINT32 opcode;
+	// What icount stood at when each inner loop below was entered, so the
+	// share each dispatch path ran is the amount it counted down.
+	int entry_icount;
 
 	ppc.cur_cycles = cycles;
 	ppc.icount = cycles;
@@ -297,7 +300,29 @@ int ppc_execute(int cycles)
 	                   ppc.dec_trigger_cycle < ppc.icount)
 	                ? ppc.dec_trigger_cycle : 0;
 
-	while( ppc.icount > ppc.icount_stop && !ppc.fatalError)
+	// The decoded cache covers main RAM and nothing else, and these games run
+	// better than 99 percent of their instructions from there. When execution
+	// is inside it the handler is a load rather than a switch and four table
+	// lookups; when it is not, the loop below this one works it out the way it
+	// always did. Which of the two runs is decided here rather than tested per
+	// instruction: ppc_change_pc sends this loop back out to its parent when
+	// execution crosses between the two.
+	entry_icount = ppc.icount;
+	while (ppc.dec_cursor != NULL && ppc.icount > ppc.icount_stop &&
+	       !ppc.fatalError)
+	{
+		ppc.pc = ppc.npc;
+		opcode = *ppc.op++;
+		ppc.npc = ppc.pc + 4;
+
+		(*ppc.dec_cursor++)(opcode);
+
+		ppc.icount--;
+	}
+	ppc.dec_cached_insns += (UINT64) (entry_icount - ppc.icount);
+
+	entry_icount = ppc.icount;
+	while( ppc.dec_cursor == NULL && ppc.icount > ppc.icount_stop && !ppc.fatalError)
 	{
 		ppc.pc = ppc.npc;
 		
@@ -330,18 +355,9 @@ int ppc_execute(int cycles)
 			default:	optable[opcode >> 26](opcode); break;
 		}
 
-		// One sample every 1024 instructions of where the code is being read
-		// from. See fetch_rom_samples.
-		if ((ppc.icount & 1023) == 0)
-		{
-			if (ppc.cur_fetch.start >= 0xFF000000)
-				ppc.fetch_rom_samples++;
-			else
-				ppc.fetch_ram_samples++;
-		}
-
 		ppc.icount--;
 	}
+	ppc.dec_uncached_insns += (UINT64) (entry_icount - ppc.icount);
 
 		if (ppc.icount == ppc.dec_trigger_cycle)
 		{

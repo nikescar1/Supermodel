@@ -263,17 +263,24 @@ typedef struct {
 	// count at which that happens. See ppc603_execute.
 	int icount_stop;
 
-	// Where the instructions being executed are coming from, sampled.
+	// How many instructions each of the two dispatch paths ran.
 	//
-	// A decoded instruction cache over the program ROM needs no invalidation
-	// at all, because the region is read only for the machine's whole life. A
-	// cache over RAM needs a dirty bit per page and a check on every store.
-	// Which of those is worth building depends entirely on where these games
-	// actually run their code from, and nothing in the emulator has ever said.
-	// Sampled every 1024 instructions rather than counted, because counting
-	// would change the thing being measured.
-	UINT64 fetch_rom_samples;
-	UINT64 fetch_ram_samples;
+	// This began as a sample of where code was being fetched from, which is
+	// what said the cache had to cover RAM: better than 99 percent of these
+	// games' instructions are executed from there. Now that the cache exists
+	// the useful question is how much of the work it actually takes, so the
+	// same two counters answer that instead. They are exact rather than
+	// sampled and still cost nothing, because the two loops are already
+	// separate and each one's share is the count it ran down.
+	UINT64 dec_cached_insns;
+	UINT64 dec_uncached_insns;
+
+	// Where the decoded dispatch cache is up to, kept in step with `op`.
+	// NULL when execution is somewhere the cache does not cover, which is
+	// how the loop above knows to fall back to working the handler out.
+	// See the cache itself, further down; the name avoids the decrementer
+	// register, which got there first.
+	void (**dec_cursor)(UINT32);
 	
 	// Cycle related
 	UINT64 total_cycles;
@@ -303,6 +310,10 @@ typedef struct {
 static PPC_REGS ppc;
 static UINT32 ppc_rotate_mask[32][32];
 
+// Defined below, where the dispatch tables it reads are declared.
+static void ppc_decode_stub(UINT32 op);
+static inline void ppc_set_dec(UINT32 newpc);
+
 static void ppc_change_pc(UINT32 newpc)
 {
 	UINT32 offset	= newpc - ppc.cur_fetch.start;		//  unsigned wrap around can happen, that's defined behavour 
@@ -311,6 +322,7 @@ static void ppc_change_pc(UINT32 newpc)
 	if (offset <= range)
 	{
 		ppc.op = &ppc.cur_fetch.ptr[offset / 4];
+		ppc_set_dec(newpc);
 		return;
 	}
 
@@ -324,6 +336,7 @@ static void ppc_change_pc(UINT32 newpc)
 			ppc.cur_fetch = ppc.fetch[i];
 
 			ppc.op = &ppc.cur_fetch.ptr[offset / 4];
+			ppc_set_dec(newpc);
 			return;
 		}
 	}
@@ -391,16 +404,107 @@ static UINT32	RAMSize = 0;
 
 static UINT8	*ROM = NULL;
 
+/*
+ * The decoded dispatch cache.
+ *
+ * Working out which function handles an instruction is a switch on the primary
+ * opcode and then an index into one of five tables, and it is done every time
+ * the instruction executes. A loop body runs millions of times a second and
+ * decodes to the same handler every one of them.
+ *
+ * So the answer is remembered, one entry per instruction word of main RAM,
+ * and the inner loop reads it instead of working it out. That replaces about
+ * seven instructions with a single load. Measured against the alternative:
+ * these games run 99.3 percent of their instructions out of RAM rather than
+ * the program ROM, which is why the cache is over RAM and has to deal with
+ * being written to.
+ *
+ * Every entry starts as a stub that decodes on demand, fills itself in, and
+ * runs the handler it found. That is what makes this need no page tables, no
+ * allocation while running and no test in the inner loop for whether an entry
+ * is present: an undecoded entry is simply an entry whose handler happens to
+ * be the decoder. Invalidating is the same idea backwards, and costs one store:
+ * putting the stub back means the next execution decodes again.
+ *
+ * One flat array over the whole 8 MB rather than pages, so that stepping from
+ * one instruction to the next is an increment with nothing to check. It costs
+ * sixteen megabytes, which is the price of not having a bounds test in the
+ * hottest loop in the emulator.
+ */
+typedef void (*PPCHandler)(UINT32);
+
+static PPCHandler	*Dec = NULL;
+static UINT32		DecEntries = 0;
+
+// Puts the stub back for the word containing `address`, so the next execution
+// of it decodes again. One store, no branch, and it does not care whether the
+// word was ever code.
+static inline void ppc_invalidate(UINT32 address)
+{
+	if (Dec != NULL && address < RAMSize)
+		Dec[address >> 2] = ppc_decode_stub;
+}
+
+void ppc_invalidate_word(UINT32 address)
+{
+	ppc_invalidate(address);
+}
+
+void ppc_invalidate_all(void)
+{
+	for (UINT32 i = 0; i < DecEntries; i++)
+		Dec[i] = ppc_decode_stub;
+}
+
+// Points the cache cursor at `newpc`, and says so when that moves execution
+// between memory the cache covers and memory it does not.
+//
+// Rather than testing for the change on every instruction, the inner loop is
+// sent back out to the one above it, which picks the loop that suits where
+// execution now is. Same device as the decrementer uses.
+static inline void ppc_set_dec(UINT32 newpc)
+{
+	PPCHandler *want = (Dec != NULL && newpc < RAMSize) ? &Dec[newpc >> 2] : NULL;
+	if ((want == NULL) != (ppc.dec_cursor == NULL))
+		ppc.icount_stop = ppc.icount;
+	ppc.dec_cursor = want;
+}
+
 void ppc_attach_ram(UINT8 *ram, UINT32 size)
 {
 	RAM = ram;
 	RAMSize = (ram != NULL) ? size : 0;
+
+	if (Dec != NULL)
+	{
+		free(Dec);
+		Dec = NULL;
+		DecEntries = 0;
+	}
+	ppc.dec_cursor = NULL;
+
+	if (RAM == NULL || RAMSize == 0)
+		return;
+
+	// A few entries of slack past the end, matching the fetch pointer, which
+	// has always been free to walk off the end of a region before a branch
+	// takes it somewhere real.
+	DecEntries = (RAMSize / 4) + 16;
+	Dec = (PPCHandler *) malloc(DecEntries * sizeof(PPCHandler));
+	if (Dec == NULL)
+	{
+		// No cache is not an error. The interpreter works out the handler the
+		// way it always did and everything below falls back to that.
+		DecEntries = 0;
+		return;
+	}
+	ppc_invalidate_all();
 }
 
-void ppc_fetch_mix(UINT64 *rom, UINT64 *ram)
+void ppc_dec_mix(UINT64 *cached, UINT64 *uncached)
 {
-	*rom = ppc.fetch_rom_samples;
-	*ram = ppc.fetch_ram_samples;
+	*cached = ppc.dec_cached_insns;
+	*uncached = ppc.dec_uncached_insns;
 }
 
 UINT8 *ppc_direct_ram(void)
@@ -466,6 +570,7 @@ static inline void WRITE8(UINT32 address, UINT8 data)
 	if (PPC_LIKELY(address < RAMSize))
 	{
 		RAM[address^3] = data;
+		ppc_invalidate(address);
 		return;
 	}
 	Bus->Write8(address,data);
@@ -476,6 +581,7 @@ static inline void WRITE16(UINT32 address, UINT16 data)
 	if (PPC_LIKELY(address < RAMSize && !(address&1)))
 	{
 		*(UINT16 *) &RAM[address^2] = data;
+		ppc_invalidate(address);
 		return;
 	}
 	Bus->Write16(address,data);
@@ -486,6 +592,7 @@ static inline void WRITE32(UINT32 address, UINT32 data)
 	if (PPC_LIKELY(address < RAMSize && !(address&3)))
 	{
 		*(UINT32 *) &RAM[address] = data;
+		ppc_invalidate(address);
 		return;
 	}
 	Bus->Write32(address,data);
@@ -497,6 +604,8 @@ static inline void WRITE64(UINT32 address, UINT64 data)
 	{
 		*(UINT32 *) &RAM[address+0] = (UINT32) (data>>32);
 		*(UINT32 *) &RAM[address+4] = (UINT32) data;
+		ppc_invalidate(address+0);
+		ppc_invalidate(address+4);
 		return;
 	}
 	Bus->Write64(address,data);
@@ -803,6 +912,29 @@ static void (* optable31[1024])(UINT32);
 static void (* optable59[1024])(UINT32);
 static void (* optable63[1024])(UINT32);
 static void (* optable[64])(UINT32);
+
+static PPCHandler ppc_decode(UINT32 opcode)
+{
+	switch (opcode >> 26)
+	{
+		case 19:	return optable19[(opcode >> 1) & 0x3ff];
+		case 31:	return optable31[(opcode >> 1) & 0x3ff];
+		case 59:	return optable59[(opcode >> 1) & 0x3ff];
+		case 63:	return optable63[(opcode >> 1) & 0x3ff];
+		default:	return optable[opcode >> 26];
+	}
+}
+
+// What every entry holds until the instruction is first executed, and what an
+// entry is put back to when the memory under it is written.
+static void ppc_decode_stub(UINT32 op)
+{
+	PPCHandler handler = ppc_decode(op);
+	// The loop has already stepped past this entry, so it is the one behind.
+	ppc.dec_cursor[-1] = handler;
+	handler(op);
+}
+
 
 #include "ppc603.c"
 
@@ -1142,6 +1274,9 @@ void ppc_save_state(CBlockFile *SaveState)
 
 void ppc_load_state(CBlockFile *SaveState)
 {	
+	// Every entry describes memory that is about to be replaced wholesale.
+	ppc_invalidate_all();
+
 	if (Result::OKAY != SaveState->FindBlock("PowerPC"))
 	{
 		ErrorLog("Unable to load PowerPC state. Save state file is corrupt.");

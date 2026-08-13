@@ -1378,6 +1378,10 @@ void CModel3::Write8(UINT32 addr, UINT8 data)
   if (addr < 0x00800000)
   {
     ram[addr^3] = data;
+    // The interpreter caches the decoded form of every instruction in RAM, and
+    // this is a write that did not come through its own fast path: a
+    // misaligned access, or another device copying in. See ppc.cpp.
+    ppc_invalidate_word(addr);
     return;
   }
 
@@ -1519,6 +1523,7 @@ void CModel3::Write16(UINT32 addr, UINT16 data)
   if (addr < 0x00800000)
   {
     *(UINT16 *) &ram[addr^2] = data;
+    ppc_invalidate_word(addr);
     return;
   }
 
@@ -1613,6 +1618,7 @@ void CModel3::Write32(UINT32 addr, UINT32 data)
   if (addr<0x00800000)
   {
     *(UINT32 *) &ram[addr] = data;
+    ppc_invalidate_word(addr);
     return;
   }
 
