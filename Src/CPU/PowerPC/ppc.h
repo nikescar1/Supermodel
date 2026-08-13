@@ -378,6 +378,11 @@ extern UINT8 *ppc_direct_ram(void);
 // fallback that works each handler out. See the fields in ppc.cpp.
 extern void ppc_dec_mix(UINT64 *cached, UINT64 *uncached);
 
+// A sampled count of executed instructions, by primary opcode (64 entries)
+// and by extended opcode within the integer group (1024). Instrumentation to
+// aim what is done to the interpreter next; see OpHist in ppc.cpp.
+extern void ppc_op_histogram(const UINT32 **primary, const UINT32 **ext31);
+
 // Throws away every decoded instruction. For anything that replaces the
 // contents of main RAM behind the interpreter's back, which is a save state
 // being loaded and nothing else so far. Writes made through the bus invalidate

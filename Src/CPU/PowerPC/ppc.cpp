@@ -314,6 +314,19 @@ static UINT32 ppc_rotate_mask[32][32];
 static void ppc_decode_stub(UINT32 op);
 static inline void ppc_set_dec(UINT32 newpc);
 
+// Stops the interpreter dead.
+//
+// The inner loops used to ask whether this had happened on every emulated
+// instruction, to catch something that ends the run. Setting the count the
+// loop is running down to means it falls out of its own accord, and the loop
+// above it, which does still ask, decides what to do. Same device the
+// decrementer and the decode cache both use.
+static inline void ppc_halt(void)
+{
+	ppc.fatalError = true;
+	ppc.icount_stop = ppc.icount;
+}
+
 static void ppc_change_pc(UINT32 newpc)
 {
 	UINT32 offset	= newpc - ppc.cur_fetch.start;		//  unsigned wrap around can happen, that's defined behavour 
@@ -343,7 +356,7 @@ static void ppc_change_pc(UINT32 newpc)
 
 	DebugLog("Invalid PC %08X, previous PC %08X\n", newpc, ppc.pc);
 	ErrorLog("PowerPC is out of bounds. Halting emulation until reset.");
-	ppc.fatalError = true;
+	ppc_halt();
 }
 
 /*
@@ -383,8 +396,10 @@ static UINT32	RAMSize = 0;
 // live register around it onto the stack.
 #if defined(__GNUC__) || defined(__clang__)
 #define PPC_LIKELY(x)	__builtin_expect(!!(x), 1)
+#define PPC_UNLIKELY(x)	__builtin_expect(!!(x), 0)
 #else
 #define PPC_LIKELY(x)	(x)
+#define PPC_UNLIKELY(x)	(x)
 #endif
 
 // Keeps a load's slow half out of its fast half.
@@ -436,24 +451,62 @@ typedef void (*PPCHandler)(UINT32);
 static PPCHandler	*Dec = NULL;
 static UINT32		DecEntries = 0;
 
+/*
+ * Which pages have ever held code, one byte each.
+ *
+ * Invalidating on every store would otherwise be the cache's own undoing. A
+ * store of four bytes would write eight bytes of Dec, so a routine copying a
+ * buffer would drag twice its length through the data cache in entries that
+ * describe memory holding no instructions at all. Games move a great deal more
+ * data than they do code.
+ *
+ * The byte says whether anything on the page behind it has ever been decoded.
+ * Almost nothing has: a store to a data page reads one byte, finds a zero and
+ * leaves Dec alone. Eight megabytes of RAM is two thousand and forty-eight
+ * pages, so the whole map is two kilobytes and simply stays in the cache.
+ *
+ * What makes it safe is that only the decoder sets a byte, and the decoder is
+ * the only thing that puts a real handler anywhere. So a clear byte means
+ * every entry on that page is still the stub, and a stub does not need
+ * invalidating. The map is never cleared for a page that goes quiet, which
+ * costs a little work on a page holding both code and data and is correct.
+ */
+// The map itself rather than a pointer to it, so reaching a byte is an index
+// off the mask and not a load of somewhere to look first. Two kilobytes covers
+// the eight megabytes every one of these machines has; a mask of zero means
+// there is no cache, and reads the one byte that is then always zero.
+#define CODE_PAGE_MAX	2048
+static UINT8		CodePage[CODE_PAGE_MAX];
+static UINT32		CodePageMask = 0;
+
 // Puts the stub back for the word containing `address`, so the next execution
-// of it decodes again. One store, no branch, and it does not care whether the
-// word was ever code.
+// of it decodes again. Callers have already established that the address is
+// inside RAM.
 static inline void ppc_invalidate(UINT32 address)
 {
-	if (Dec != NULL && address < RAMSize)
+	if (PPC_UNLIKELY(CodePage[(address >> 12) & CodePageMask] != 0))
 		Dec[address >> 2] = ppc_decode_stub;
+}
+
+// Notes that the word at `address` has been decoded, so stores to its page
+// start clearing entries. See CodePage.
+static inline void ppc_note_code(UINT32 address)
+{
+	CodePage[(address >> 12) & CodePageMask] = 1;
 }
 
 void ppc_invalidate_word(UINT32 address)
 {
-	ppc_invalidate(address);
+	if (address < RAMSize)
+		ppc_invalidate(address);
 }
 
 void ppc_invalidate_all(void)
 {
 	for (UINT32 i = 0; i < DecEntries; i++)
 		Dec[i] = ppc_decode_stub;
+	// Nothing is decoded any more, so nothing needs invalidating either.
+	memset(CodePage, 0, (size_t) CodePageMask + 1);
 }
 
 // Points the cache cursor at `newpc`, and says so when that moves execution
@@ -481,9 +534,19 @@ void ppc_attach_ram(UINT8 *ram, UINT32 size)
 		Dec = NULL;
 		DecEntries = 0;
 	}
+	CodePageMask = 0;
+	CodePage[0] = 0;
 	ppc.dec_cursor = NULL;
 
 	if (RAM == NULL || RAMSize == 0)
+		return;
+
+	// The page map is indexed with a mask rather than a bounds test, which
+	// wants a power of two, and it is a fixed size. Every machine this runs
+	// on has eight megabytes; anything else simply goes without the cache
+	// rather than growing a second way of doing this.
+	const UINT32 pages = RAMSize >> 12;
+	if (pages == 0 || pages > CODE_PAGE_MAX || (pages & (pages - 1)) != 0)
 		return;
 
 	// A few entries of slack past the end, matching the fetch pointer, which
@@ -498,6 +561,7 @@ void ppc_attach_ram(UINT8 *ram, UINT32 size)
 		DecEntries = 0;
 		return;
 	}
+	CodePageMask = pages - 1;
 	ppc_invalidate_all();
 }
 
@@ -815,7 +879,7 @@ static inline void ppc_set_spr(int spr, UINT32 value)
 
 	ErrorLog("PowerPC wrote to an invalid register. Halting emulation until reset.");
 	DebugLog("ppc: set_spr: unknown spr %d (%03X) !\n", spr, spr);
-	ppc.fatalError = true;
+	ppc_halt();
 }
 
 static inline UINT32 ppc_get_spr(int spr)
@@ -877,7 +941,7 @@ static inline UINT32 ppc_get_spr(int spr)
 	
 	ErrorLog("PowerPC read from an invalid register. Halting emulation until reset.");
 	DebugLog("ppc: get_spr: unknown spr %d (%03X) !\n", spr, spr);
-	ppc.fatalError = true;
+	ppc_halt();
 	return 0;
 }
 
@@ -887,7 +951,7 @@ static inline void ppc_set_msr(UINT32 value)
 	{
 		ErrorLog("PowerPC entered an unemulated mode. Halting emulation until reset.");
 		DebugLog("ppc: set_msr: little_endian mode not supported !\n");
-		ppc.fatalError = true;
+		ppc_halt();
 	}
 
 	MSR = value;
@@ -913,11 +977,69 @@ static void (* optable59[1024])(UINT32);
 static void (* optable63[1024])(UINT32);
 static void (* optable[64])(UINT32);
 
+/*
+ * Which instructions the emulated processor actually spends its time on.
+ *
+ * Everything left to do to the interpreter is a choice between shapes of work
+ * that are expensive to build and impossible to rank by reading the code:
+ * writing out more handlers by hand, joining common pairs into one, or leaving
+ * the interpreter alone. Guessing which instructions matter is how a fortnight
+ * gets spent making four percent of the run faster.
+ *
+ * One in every 1024 executed instructions is counted, by primary opcode and,
+ * for the integer group that holds most of them, by extended opcode too. The
+ * sample costs a test and a branch in the inner loop, which is real, and it is
+ * meant to be taken out again once it has said what it has to say.
+ */
+static UINT32	OpHist[64];
+static UINT32	OpHist31[1024];
+
+static inline void ppc_sample_opcode(UINT32 opcode)
+{
+	const UINT32 primary = opcode >> 26;
+	OpHist[primary]++;
+	if (primary == 31)
+		OpHist31[(opcode >> 1) & 0x3ff]++;
+}
+
+void ppc_op_histogram(const UINT32 **primary, const UINT32 **ext31)
+{
+	*primary = OpHist;
+	*ext31 = OpHist31;
+}
+
+// The branch shapes that are worth a handler of their own. See ppc_ops.c.
+static void ppc_bc_true(UINT32 op);
+static void ppc_bc_false(UINT32 op);
+static void ppc_blr(UINT32 op);
+static void ppc_bctr(UINT32 op);
+
 static PPCHandler ppc_decode(UINT32 opcode)
 {
+	// The fields a branch is made of never change, so which of them applies
+	// is settled here, once, rather than on every execution. BO is the five
+	// bits at 21, and the low two are the link and absolute bits.
+	const UINT32 bo = (opcode >> 21) & 0x1f;
+	const UINT32 lk_aa = opcode & 0x3;
+
 	switch (opcode >> 26)
 	{
-		case 19:	return optable19[(opcode >> 1) & 0x3ff];
+		case 16:
+			// Relative, no link: the ordinary if and the ordinary loop.
+			if (lk_aa == 0)
+			{
+				if (bo == 0x0c)		return ppc_bc_true;
+				if (bo == 0x04)		return ppc_bc_false;
+			}
+			return optable[16];
+		case 19:
+			// blr and bctr, both unconditional and both without link.
+			if (bo == 0x14 && lk_aa == 0)
+			{
+				if (((opcode >> 1) & 0x3ff) == 16)	return ppc_blr;
+				if (((opcode >> 1) & 0x3ff) == 528)	return ppc_bctr;
+			}
+			return optable19[(opcode >> 1) & 0x3ff];
 		case 31:	return optable31[(opcode >> 1) & 0x3ff];
 		case 59:	return optable59[(opcode >> 1) & 0x3ff];
 		case 63:	return optable63[(opcode >> 1) & 0x3ff];
@@ -931,7 +1053,11 @@ static void ppc_decode_stub(UINT32 op)
 {
 	PPCHandler handler = ppc_decode(op);
 	// The loop has already stepped past this entry, so it is the one behind.
-	ppc.dec_cursor[-1] = handler;
+	PPCHandler *entry = ppc.dec_cursor - 1;
+	*entry = handler;
+	// This page holds code, so stores to it have something to invalidate from
+	// here on. Four bytes an entry, four kilobytes a page.
+	ppc_note_code((UINT32) (entry - Dec) << 2);
 	handler(op);
 }
 

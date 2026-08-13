@@ -201,7 +201,7 @@ void ppc603_exception(int exception)
 		default:
 			ErrorLog("PowerPC triggered an unknown exception. Emulation halted until reset.");
 			DebugLog("PowerPC triggered an unknown exception (%d).\n", exception);
-			ppc.fatalError = true;
+			ppc_halt();
 			break;
 	}
 }
@@ -307,13 +307,20 @@ int ppc_execute(int cycles)
 	// always did. Which of the two runs is decided here rather than tested per
 	// instruction: ppc_change_pc sends this loop back out to its parent when
 	// execution crosses between the two.
+	// Neither of these asks about the fatal flag. Anything that raises it
+	// stops the count as well, so the loop falls out on the test it was
+	// already doing; the loop above this one decides what to do about it.
 	entry_icount = ppc.icount;
-	while (ppc.dec_cursor != NULL && ppc.icount > ppc.icount_stop &&
-	       !ppc.fatalError)
+	while (ppc.dec_cursor != NULL && ppc.icount > ppc.icount_stop)
 	{
 		ppc.pc = ppc.npc;
 		opcode = *ppc.op++;
 		ppc.npc = ppc.pc + 4;
+
+		// One instruction in every 1024, to say where the time goes. See
+		// OpHist; this is instrumentation and is meant to come out again.
+		if (PPC_UNLIKELY((ppc.icount & 1023) == 0))
+			ppc_sample_opcode(opcode);
 
 		(*ppc.dec_cursor++)(opcode);
 
@@ -322,7 +329,7 @@ int ppc_execute(int cycles)
 	ppc.dec_cached_insns += (UINT64) (entry_icount - ppc.icount);
 
 	entry_icount = ppc.icount;
-	while( ppc.dec_cursor == NULL && ppc.icount > ppc.icount_stop && !ppc.fatalError)
+	while( ppc.dec_cursor == NULL && ppc.icount > ppc.icount_stop )
 	{
 		ppc.pc = ppc.npc;
 		

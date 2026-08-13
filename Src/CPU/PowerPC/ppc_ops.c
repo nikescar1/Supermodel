@@ -55,7 +55,7 @@ static void ppc_unimplemented(UINT32 op)
 {
 	ErrorLog("PowerPC hit an unimplemented instruction. Halting emulation until reset.");
 	DebugLog("PowerPC encountered an unimplemented opcode %08X at %08X\n", op, ppc.pc);
-	ppc.fatalError = true;
+	ppc_halt();
 }
 
 static void ppc_addx(UINT32 op)
@@ -257,6 +257,60 @@ static void ppc_bx(UINT32 op)
 		LR = ppc.pc + 4;
 	}
 
+	ppc_change_pc(ppc.npc);
+}
+
+/*
+ * The branches worth writing out in full.
+ *
+ * check_condition_code below is general: it reads the five bits of BO apart
+ * and works out from them whether to decrement the count register, whether
+ * the count matters, and which way round the condition bit is meant. Those
+ * five bits are part of the instruction, so they are the same every single
+ * time a given branch is executed, and the decode cache means the question
+ * can be settled once instead of a few hundred thousand times a frame.
+ *
+ * Three forms account for nearly every branch a compiler emits: branch if a
+ * condition bit is set, branch if it is clear, and return. So those three get
+ * handlers that do only what they actually do. Everything else still goes to
+ * the general one, which is why this is safe: it is an optimisation of the
+ * common shapes rather than a reimplementation of the instruction.
+ */
+
+// bc with BO=01100: branch if the condition bit is set. No link, relative.
+static void ppc_bc_true(UINT32 op)
+{
+	if (CRBIT(BI))
+	{
+		ppc.npc = (SIMM16 & ~0x3) + ppc.pc;
+		ppc_change_pc(ppc.npc);
+	}
+}
+
+// bc with BO=00100: branch if the condition bit is clear. No link, relative.
+static void ppc_bc_false(UINT32 op)
+{
+	if (!CRBIT(BI))
+	{
+		ppc.npc = (SIMM16 & ~0x3) + ppc.pc;
+		ppc_change_pc(ppc.npc);
+	}
+}
+
+// bclr with BO=10100 and no link, which is how every function returns.
+static void ppc_blr(UINT32 op)
+{
+	(void) op;
+	ppc.npc = LR & ~0x3;
+	ppc_change_pc(ppc.npc);
+}
+
+// bcctr with BO=10100 and no link: a jump through the count register, which
+// is how a switch table and a call through a pointer both land.
+static void ppc_bctr(UINT32 op)
+{
+	(void) op;
+	ppc.npc = CTR & ~0x3;
 	ppc_change_pc(ppc.npc);
 }
 
@@ -1702,7 +1756,7 @@ static void ppc_invalid(UINT32 op)
 {
 	ErrorLog("PowerPC hit an invalid instruction. Halting emulation until reset.");
 	DebugLog("ppc: Invalid opcode %08X PC : %X, %08X\n", op, ppc.pc, ppc.npc);
-	ppc.fatalError = true;
+	ppc_halt();
 }
 
 
@@ -2090,7 +2144,7 @@ static void ppc_mftb(UINT32 op)
 		default:	
 			ErrorLog("PowerPC read from an invalid register. Halting emulation until reset.");
 			DebugLog("ppc: Invalid timebase register %d at %08X\n", x, ppc.pc);
-			ppc.fatalError = true;
+			ppc_halt();
 			break;
 	}
 }
