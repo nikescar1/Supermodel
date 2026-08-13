@@ -317,43 +317,111 @@ static void ppc_change_pc(UINT32 newpc)
 	ppc.fatalError = true;
 }
 
+/*
+ * Main RAM, reached without going through the bus object.
+ *
+ * Every load and store the interpreter performs is a virtual call on IBus, and
+ * the overwhelming majority of them land in the flat RAM at the bottom of the
+ * map, where the handler does nothing but compare the address and index an
+ * array. On a desktop that call is cheap enough not to matter. On a phone the
+ * emulated processor is the entire frame budget: measured on a Snapdragon,
+ * Sega Rally spends 26.5 ms of a 17.4 ms frame inside this loop, and an
+ * indirect call that cannot be inlined is paid for on every one of those
+ * instructions that touches memory.
+ *
+ * So the region is borrowed once, by pointer, and the common case becomes a
+ * compare and an index with nothing between it and the caller. Anything that
+ * is not this region, and anything misaligned, goes to the bus exactly as
+ * before. The byte swizzling is not decoration: Supermodel stores RAM with
+ * each aligned word already byte reversed, so an 8 bit access indexes addr^3
+ * and a 16 bit one addr^2. These have to agree with CModel3's own handlers to
+ * the letter, or the two paths will disagree about what memory holds.
+ *
+ * Zero size disables all of it, which is what a machine that never attached
+ * RAM gets.
+ */
+static UINT8	*RAM = NULL;
+static UINT32	RAMSize = 0;
+
+void ppc_attach_ram(UINT8 *ram, UINT32 size)
+{
+	RAM = ram;
+	RAMSize = (ram != NULL) ? size : 0;
+}
+
 static inline UINT8 READ8(UINT32 address)
 {
+	if (address < RAMSize)
+		return RAM[address^3];
 	return Bus->Read8(address);
 }
 
 static inline UINT16 READ16(UINT32 address)
 {
+	if (address < RAMSize && !(address&1))
+		return *(UINT16 *) &RAM[address^2];
 	return Bus->Read16(address);
 }
 
 static inline UINT32 READ32(UINT32 address)
 {
+	if (address < RAMSize && !(address&3))
+		return *(UINT32 *) &RAM[address];
 	return Bus->Read32(address);
 }
 
 static inline UINT64 READ64(UINT32 address)
 {
+	// The first test also rules out an address near the top of the map whose
+	// +8 would wrap around and look in range.
+	if (address < RAMSize && address+8 <= RAMSize && !(address&3))
+	{
+		UINT64 data = *(UINT32 *) &RAM[address];
+		data <<= 32;
+		data |= *(UINT32 *) &RAM[address+4];
+		return data;
+	}
 	return Bus->Read64(address);
 }
 
 static inline void WRITE8(UINT32 address, UINT8 data)
 {
+	if (address < RAMSize)
+	{
+		RAM[address^3] = data;
+		return;
+	}
 	Bus->Write8(address,data);
 }
 
 static inline void WRITE16(UINT32 address, UINT16 data)
 {
+	if (address < RAMSize && !(address&1))
+	{
+		*(UINT16 *) &RAM[address^2] = data;
+		return;
+	}
 	Bus->Write16(address,data);
 }
 
 static inline void WRITE32(UINT32 address, UINT32 data)
 {
+	if (address < RAMSize && !(address&3))
+	{
+		*(UINT32 *) &RAM[address] = data;
+		return;
+	}
 	Bus->Write32(address,data);
 }
 
 static inline void WRITE64(UINT32 address, UINT64 data)
 {
+	if (address < RAMSize && address+8 <= RAMSize && !(address&3))
+	{
+		*(UINT32 *) &RAM[address+0] = (UINT32) (data>>32);
+		*(UINT32 *) &RAM[address+4] = (UINT32) data;
+		return;
+	}
 	Bus->Write64(address,data);
 }
 
@@ -720,6 +788,11 @@ void ppc_init(const PPC_CONFIG *config)
 	int pll_config = 0;
 	float multiplier;
 	int i ;
+
+	// Until somebody says otherwise there is no directly reachable RAM and
+	// every access goes to the bus. A previous machine's pointer must never
+	// survive into this one.
+	ppc_attach_ram(NULL, 0);
 
 	ppc_base_init() ;
 

@@ -2942,6 +2942,9 @@ Result CModel3::LoadGame(const Game &game, const ROMSet &rom_set)
   // Initialize CPU
   ppc_init(&ppc_config);
   ppc_attach_bus(this);
+  // The same 8 MB the read and write handlers below special case first. Lent
+  // to the interpreter so those accesses need no call at all; see ppc.cpp.
+  ppc_attach_ram(ram, 0x00800000);
   PPCFetchRegions[0].start = 0;
   PPCFetchRegions[0].end = 0x007FFFFF;
   PPCFetchRegions[0].ptr = (UINT32 *) ram;

@@ -363,6 +363,12 @@ extern void ppc_set_timer_ratio(int ratio);
 
 // These have been added to support the new Supermodel
 extern void ppc_attach_bus(class IBus *BusPtr);		// must be called first!
+
+// Lends the interpreter the flat RAM region at the bottom of the address map,
+// so loads and stores landing in it skip the bus object entirely. `size` is in
+// bytes and the region must start at address zero. NULL withdraws it, which is
+// what a machine with no such region gets. See ppc.cpp.
+extern void ppc_attach_ram(UINT8 *ram, UINT32 size);
 extern void ppc_save_state(class CBlockFile *SaveState);
 extern void ppc_load_state(class CBlockFile *SaveState);
 extern UINT32 ppc_get_gpr(unsigned num);
