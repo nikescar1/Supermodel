@@ -330,6 +330,16 @@ int ppc_execute(int cycles)
 			default:	optable[opcode >> 26](opcode); break;
 		}
 
+		// One sample every 1024 instructions of where the code is being read
+		// from. See fetch_rom_samples.
+		if ((ppc.icount & 1023) == 0)
+		{
+			if (ppc.cur_fetch.start >= 0xFF000000)
+				ppc.fetch_rom_samples++;
+			else
+				ppc.fetch_ram_samples++;
+		}
+
 		ppc.icount--;
 	}
 

@@ -262,6 +262,18 @@ typedef struct {
 	// decrementer is due to fire inside this slice, in which case it is the
 	// count at which that happens. See ppc603_execute.
 	int icount_stop;
+
+	// Where the instructions being executed are coming from, sampled.
+	//
+	// A decoded instruction cache over the program ROM needs no invalidation
+	// at all, because the region is read only for the machine's whole life. A
+	// cache over RAM needs a dirty bit per page and a check on every store.
+	// Which of those is worth building depends entirely on where these games
+	// actually run their code from, and nothing in the emulator has ever said.
+	// Sampled every 1024 instructions rather than counted, because counting
+	// would change the thing being measured.
+	UINT64 fetch_rom_samples;
+	UINT64 fetch_ram_samples;
 	
 	// Cycle related
 	UINT64 total_cycles;
@@ -383,6 +395,12 @@ void ppc_attach_ram(UINT8 *ram, UINT32 size)
 {
 	RAM = ram;
 	RAMSize = (ram != NULL) ? size : 0;
+}
+
+void ppc_fetch_mix(UINT64 *rom, UINT64 *ram)
+{
+	*rom = ppc.fetch_rom_samples;
+	*ram = ppc.fetch_ram_samples;
 }
 
 UINT8 *ppc_direct_ram(void)

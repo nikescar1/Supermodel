@@ -374,6 +374,10 @@ extern void ppc_attach_ram(UINT8 *ram, UINT32 size);
 // bulk and would otherwise go through the bus one word at a time.
 extern UINT8 *ppc_direct_ram(void);
 
+// How the executed instructions divide between the program ROM and RAM, as
+// sample counts rather than totals. See the fields in ppc.cpp.
+extern void ppc_fetch_mix(UINT64 *rom, UINT64 *ram);
+
 // The fixed program ROM, lent on the same terms as RAM: read only, never moved,
 // and stored with each aligned word already byte reversed, so the swizzle is
 // identical. Games read constant pools, jump tables and model data straight out
