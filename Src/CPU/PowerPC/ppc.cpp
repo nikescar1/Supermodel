@@ -1179,10 +1179,8 @@ static bool ppc_spin_fields(UINT32 op, UINT32 *reads, UINT32 *writes)
 
 // Whether the conditional branch at `address` closes a loop that can only be
 // ended from outside. See above.
-static bool ppc_spin_loop(UINT32 op, UINT32 address)
+static bool ppc_spin_loop(UINT32 address, INT32 displacement)
 {
-	const INT32 displacement = (INT32)(INT16)(op & 0xffff) & ~0x3;
-
 	// Backwards, and to somewhere this can read.
 	if (displacement >= 0 || displacement < -(PPC_SPIN_MAX * 4))
 		return false;
@@ -1238,10 +1236,8 @@ static bool ppc_spin_loop(UINT32 op, UINT32 address)
  * The stop is one above the count the loop is running down to, because the
  * loop decrements once more before testing.
  */
-static inline void ppc_note_spin(UINT32 op)
+static inline void ppc_note_spin_span(UINT32 span)
 {
-	const UINT32 span = (UINT32) (-(((INT32)(INT16)(op & 0xffff)) & ~0x3)) >> 2;
-
 	// The body and the branch itself, which is why it is one more than the
 	// distance the branch jumps.
 	if (ppc.spin_pc == ppc.pc &&
@@ -1258,6 +1254,12 @@ static inline void ppc_note_spin(UINT32 op)
 	ppc.spin_bus = BusTouches;
 }
 
+// The conditional form, whose jump is the sixteen bit field.
+static inline void ppc_note_spin(UINT32 op)
+{
+	ppc_note_spin_span((UINT32) (-(((INT32)(INT16)(op & 0xffff)) & ~0x3)) >> 2);
+}
+
 // How many instructions were skipped rather than executed. Against the two
 // dispatch counts, this says how much of the emulated processor's time was
 // spent waiting.
@@ -1271,6 +1273,15 @@ static void ppc_bc_true(UINT32 op);
 static void ppc_bc_false(UINT32 op);
 static void ppc_bc_true_idle(UINT32 op);
 static void ppc_bc_false_idle(UINT32 op);
+static void ppc_b_idle(UINT32 op);
+
+// The arithmetic and logic worth settling RC and OE for. See ppc_ops.c.
+template <bool kRc> static void ppc_and_t(UINT32 op);
+template <bool kRc> static void ppc_or_t(UINT32 op);
+template <bool kRc> static void ppc_xor_t(UINT32 op);
+template <bool kRc> static void ppc_rlwinm_t(UINT32 op);
+template <bool kRc, bool kOe> static void ppc_add_t(UINT32 op);
+template <bool kRc, bool kOe> static void ppc_subf_t(UINT32 op);
 static void ppc_blr(UINT32 op);
 static void ppc_bctr(UINT32 op);
 
@@ -1300,7 +1311,28 @@ static PPCHandler ppc_decode(UINT32 opcode)
 				if (((opcode >> 1) & 0x3ff) == 528)	return ppc_bctr;
 			}
 			return optable19[(opcode >> 1) & 0x3ff];
-		case 31:	return optable31[(opcode >> 1) & 0x3ff];
+		case 21:
+			// rlwinm, which is every shift and every bitfield extract a
+			// compiler emits, and by some distance the most common of these.
+			return (opcode & 1) ? ppc_rlwinm_t<true> : ppc_rlwinm_t<false>;
+		case 31:
+		{
+			// The extended field already has the overflow bit in it, so the
+			// four combinations of RC and OE are four separate table slots
+			// and picking between them costs nothing here.
+			const UINT32 rc = opcode & 1;
+			switch ((opcode >> 1) & 0x3ff)
+			{
+				case 28:	return rc ? ppc_and_t<true> : ppc_and_t<false>;
+				case 444:	return rc ? ppc_or_t<true> : ppc_or_t<false>;
+				case 316:	return rc ? ppc_xor_t<true> : ppc_xor_t<false>;
+				case 266:	return rc ? ppc_add_t<true, false> : ppc_add_t<false, false>;
+				case 266 + 512:	return rc ? ppc_add_t<true, true> : ppc_add_t<false, true>;
+				case 40:	return rc ? ppc_subf_t<true, false> : ppc_subf_t<false, false>;
+				case 40 + 512:	return rc ? ppc_subf_t<true, true> : ppc_subf_t<false, true>;
+			}
+			return optable31[(opcode >> 1) & 0x3ff];
+		}
 		case 59:	return optable59[(opcode >> 1) & 0x3ff];
 		case 63:	return optable63[(opcode >> 1) & 0x3ff];
 		default:	return optable[opcode >> 26];
@@ -1319,10 +1351,29 @@ static void ppc_decode_stub(UINT32 op)
 	// Whether this branch closes a loop that only waits. The walk over the
 	// body is not cheap, which is exactly why it belongs here: once, when the
 	// instruction is first seen, rather than every time it runs.
-	if (IdleSkip && handler == ppc_bc_true && ppc_spin_loop(op, address))
-		handler = ppc_bc_true_idle;
-	else if (IdleSkip && handler == ppc_bc_false && ppc_spin_loop(op, address))
-		handler = ppc_bc_false_idle;
+	if (IdleSkip)
+	{
+		// The conditional forms, whose jump is the sixteen bit field.
+		const INT32 conditional = (INT32)(INT16)(op & 0xffff) & ~0x3;
+		if (handler == ppc_bc_true && ppc_spin_loop(address, conditional))
+			handler = ppc_bc_true_idle;
+		else if (handler == ppc_bc_false && ppc_spin_loop(address, conditional))
+			handler = ppc_bc_false_idle;
+		else if ((op >> 26) == 18 && (op & 0x3) == 0)
+		{
+			// A branch that always jumps backwards over a body doing nothing
+			// but read is a loop with no way out at all: it cannot end even in
+			// principle until an interrupt changes something. So it never
+			// needs the run-time half, only the static one. The jump is the
+			// twenty-six bit field here, sign extended, which is why the
+			// analysis is handed a displacement rather than working it out.
+			INT32 li = (INT32) (op & 0x3fffffc);
+			if (li & 0x2000000)
+				li |= (INT32) 0xfc000000;
+			if (ppc_spin_loop(address, li))
+				handler = ppc_b_idle;
+		}
+	}
 
 	*entry = handler;
 	// This page holds code, so stores to it have something to invalidate from

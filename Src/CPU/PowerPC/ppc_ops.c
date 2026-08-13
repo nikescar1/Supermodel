@@ -205,6 +205,66 @@ static void ppc_addzex(UINT32 op)
 	}
 }
 
+/*
+ * The same instructions again, with the bits that never change taken out.
+ *
+ * Every one of these tests a bit of its own opcode on every execution: RC to
+ * say whether to write a condition field, OE to say whether to record an
+ * overflow. Both are part of the instruction, so both are the same answer
+ * every time it runs, and the decode cache means the question can be settled
+ * once. The general handler stays and still serves anything not listed in
+ * ppc_decode, which is what keeps this an optimisation of the common shapes
+ * rather than a second implementation of the instruction.
+ *
+ * Templates rather than copies because this file is compiled as C++, so the
+ * bodies are shared and the branches fold away.
+ */
+template <bool kRc> static void ppc_and_t(UINT32 op)
+{
+	REG(RA) = REG(RS) & REG(RB);
+	if (kRc) SET_CR0(REG(RA));
+}
+
+template <bool kRc> static void ppc_or_t(UINT32 op)
+{
+	REG(RA) = REG(RS) | REG(RB);
+	if (kRc) SET_CR0(REG(RA));
+}
+
+template <bool kRc> static void ppc_xor_t(UINT32 op)
+{
+	REG(RA) = REG(RS) ^ REG(RB);
+	if (kRc) SET_CR0(REG(RA));
+}
+
+template <bool kRc> static void ppc_rlwinm_t(UINT32 op)
+{
+	const UINT32 mask = GET_ROTATE_MASK(MB, ME);
+	const UINT32 rs = REG(RS);
+	const int sh = SH;
+	const UINT32 r = (rs << sh) | (rs >> (32 - sh));
+	REG(RA) = r & mask;
+	if (kRc) SET_CR0(REG(RA));
+}
+
+template <bool kRc, bool kOe> static void ppc_add_t(UINT32 op)
+{
+	const UINT32 ra = REG(RA);
+	const UINT32 rb = REG(RB);
+	REG(RT) = ra + rb;
+	if (kOe) SET_ADD_OV(REG(RT), ra, rb);
+	if (kRc) SET_CR0(REG(RT));
+}
+
+template <bool kRc, bool kOe> static void ppc_subf_t(UINT32 op)
+{
+	const UINT32 ra = REG(RA);
+	const UINT32 rb = REG(RB);
+	REG(RT) = rb - ra;
+	if (kOe) SET_SUB_OV(REG(RT), rb, ra);
+	if (kRc) SET_CR0(REG(RT));
+}
+
 static void ppc_andx(UINT32 op)
 {
 	REG(RA) = REG(RS) & REG(RB);
@@ -318,6 +378,26 @@ static void ppc_bc_false_idle(UINT32 op)
 		ppc.npc = (SIMM16 & ~0x3) + ppc.pc;
 		ppc_change_pc(ppc.npc);
 	}
+}
+
+// An unconditional branch backwards over a body that only reads.
+//
+// This one has no exit at all: the branch always jumps, and the analysis has
+// already established that the body only reads. It runs until an interrupt
+// takes the processor somewhere else. It still goes through the same run-time
+// check as the conditional pair, and not out of caution about the loop: that
+// check is also what notices the body reading a device register, whose value
+// moves on its own and whose reading can have an effect.
+static void ppc_b_idle(UINT32 op)
+{
+	INT32 li = (INT32) (op & 0x3fffffc);
+	if (li & 0x2000000)
+		li |= (INT32) 0xfc000000;
+
+	ppc_note_spin_span((UINT32) (-li) >> 2);
+
+	ppc.npc = ppc.pc + (UINT32) li;
+	ppc_change_pc(ppc.npc);
 }
 
 // bclr with BO=10100 and no link, which is how every function returns.
