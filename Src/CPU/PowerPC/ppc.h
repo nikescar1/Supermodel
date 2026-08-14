@@ -391,6 +391,13 @@ extern void ppc_op_histogram(UINT32 *primary, UINT32 *ext31);
 // next instruction decoded, so it is meant to be set before a game runs.
 extern void ppc_set_idle_skip(bool enabled);
 
+// Whether a loop waiting on the decrementer counts as a waiting loop. On
+// unless turned off, and exact rather than approximate: the slice already
+// stops at the count the decrementer fires on, so what is skipped is the
+// reading and comparing and not any of the time. Same caveat as above about
+// when it takes effect.
+extern void ppc_set_idle_skip_timers(bool enabled);
+
 // How many instructions were skipped rather than executed, because the
 // processor was in a loop that could not end before its slice did. See
 // ppc_note_spin in ppc.cpp.

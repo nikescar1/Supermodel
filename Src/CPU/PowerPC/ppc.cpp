@@ -444,6 +444,18 @@ void ppc_set_idle_skip(bool enabled)
 	IdleSkip = enabled;
 }
 
+// Whether a loop waiting on the decrementer counts as waiting. Separate from
+// the switch above because it is a separate claim: the one above says a loop
+// reading memory nothing can write is going nowhere, and this one says the
+// same of a loop reading a register only the clock moves, which rests on the
+// slice already stopping at the moment the clock moves it. See ppc_spin_fields.
+static bool	IdleSkipTimers = true;
+
+void ppc_set_idle_skip_timers(bool enabled)
+{
+	IdleSkipTimers = enabled;
+}
+
 // The longest waiting loop worth recognising, in instructions. Long enough for
 // a poll that masks a bit before comparing it, short enough that walking the
 // body costs nothing. See ppc_spin_loop, and ppc_invalidate_window, which has
@@ -1175,6 +1187,39 @@ static bool ppc_spin_fields(UINT32 op, UINT32 *reads, UINT32 *writes)
 					*reads = 1u << rs;
 					*writes = 1u << ra;
 					return true;
+
+				// mfspr, which is how a game waits on the decrementer.
+				//
+				// Skipping such a loop is exact rather than approximate, and
+				// that is worth being precise about because it is the reason
+				// this is allowed at all. A special register cannot change
+				// without an instruction changing it, and the run-time half
+				// already proves no other instruction ran. The decrementer is
+				// the one that moves on its own, and the loop that waits on it
+				// is skipped to ppc.icount_stop, which ppc603.c has already
+				// set to the exact count the decrementer fires at whenever it
+				// fires inside this slice. So the exception is taken on the
+				// instruction it would have been taken on, and what is skipped
+				// is only the reading and comparing in between.
+				//
+				// The timebase is the exception to the exception. It also
+				// moves on its own, and unlike the decrementer it has no
+				// trigger to stop at: a loop waiting for it to reach a value
+				// ends partway through a slice at a count nothing here knows,
+				// and skipping to the end of the slice would end the wait
+				// late. So a read of it disqualifies the loop, and mftb, which
+				// is a read of it under another name, is not listed at all.
+				case 339:
+				{
+					if (!IdleSkipTimers)
+						return false;
+					const UINT32 field = (op >> 11) & 0x3ff;
+					const UINT32 spr = ((field & 0x1f) << 5) | (field >> 5);
+					if (spr == SPR603E_TBL_R || spr == SPR603E_TBU_R)
+						return false;
+					*writes = 1u << rs;
+					return true;
+				}
 			}
 			return false;
 	}
