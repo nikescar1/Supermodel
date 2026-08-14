@@ -1195,7 +1195,7 @@ static bool ppc_spin_fields(UINT32 op, UINT32 *reads, UINT32 *writes)
  */
 enum SpinWhy
 {
-	SPIN_WHY_RANGE = 0,	// not backwards, too long, or not in RAM
+	SPIN_WHY_RANGE = 0,	// the jump is too long, so the body is too long
 	SPIN_WHY_OP,		// the body holds something that is not a pure read
 	SPIN_WHY_DEP,		// the body reads a register it writes, so it moves on
 	SPIN_WHY_COUNT
@@ -1331,17 +1331,29 @@ void ppc_idle_skipped(UINT64 *skipped)
 void ppc_idle_report(char *out, size_t size)
 {
 	static const char *const kWhy[SPIN_WHY_COUNT] =
-		{ "not-in-ram", "body-op", "body-writes-what-it-reads" };
+		{ "body-too-long", "body-op", "body-writes-what-it-reads" };
 	static const char *const kMiss[4] =
 		{ "other-branch", "bus-touched", "wrong-count", "slice-over" };
 
-	int at = snprintf(out, size, "idle: skipped %llu",
-	                  (unsigned long long) SpinHits);
+	// snprintf returns what it would have written, not what it did, so adding
+	// its return to a cursor walks off the end of a buffer that filled up. One
+	// cursor that stops at the end keeps every line below honest.
+	size_t at = 0;
+	const auto add = [&](const char *format, auto... rest)
+	{
+		if (at + 1 < size)
+		{
+			const int wrote = snprintf(out + at, size - at, format, rest...);
+			at = (wrote < 0 || (size_t) wrote >= size - at) ? size - 1
+			                                                : at + (size_t) wrote;
+		}
+	};
+
+	add("idle: skipped %llu", (unsigned long long) SpinHits);
 	for (int i = 0; i < 4; i++)
 	{
 		if (SpinMissHits[i] != 0)
-			at += snprintf(out + at, size - at, " %s %llu", kMiss[i],
-			               (unsigned long long) SpinMissHits[i]);
+			add(" %s %llu", kMiss[i], (unsigned long long) SpinMissHits[i]);
 	}
 
 	// Whichever rejected loop went round most is the one worth naming.
@@ -1354,22 +1366,36 @@ void ppc_idle_report(char *out, size_t size)
 	}
 	if (worst >= 0)
 	{
-		// The recorded address is the one after the branch, which is what the
-		// interpreter has in hand when it takes it.
-		const UINT32 branch = SpinRejectPc[worst] - 4;
-		at += snprintf(out + at, size - at, " | rejected %s %llu at %08X",
-		               kWhy[worst], (unsigned long long) SpinRejectHits[worst],
-		               branch);
-		if (branch < RAMSize && branch >= PPC_SPIN_MAX * 4)
+		// A relative branch jumps from its own address, which is what the
+		// interpreter holds in ppc.pc while the handler runs, so the recorded
+		// address is the branch itself.
+		const UINT32 branch = SpinRejectPc[worst];
+		add(" | rejected %s %llu at %08X", kWhy[worst],
+		    (unsigned long long) SpinRejectHits[worst], branch);
+		if (branch < RAMSize)
 		{
 			const UINT32 op = *(UINT32 *) &RAM[branch];
-			INT32 displacement = (INT32)(INT16)(op & 0xffff) & ~0x3;
-			UINT32 span = (displacement < 0 && displacement >= -(PPC_SPIN_MAX * 4))
-			              ? (UINT32) (-displacement) >> 2 : 0;
-			for (UINT32 i = 0; i < span && at < (int) size - 16; i++)
-				at += snprintf(out + at, size - at, " %08X",
-				               *(UINT32 *) &RAM[branch + (UINT32)displacement + i * 4]);
-			at += snprintf(out + at, size - at, " [%08X]", op);
+			const INT32 displacement = (INT32)(INT16)(op & 0xffff) & ~0x3;
+			const INT32 span = -displacement >> 2;
+			add(" span %d:", span);
+
+			// The body, with the instructions that broke the rule marked. The
+			// rule says which of them was possible, not which one it was, and
+			// the second is the one worth reading. Only as much of a long body
+			// as fits: a loop of two hundred instructions has already said
+			// what it had to say by being one.
+			if (displacement < 0 && (UINT32) -displacement <= branch)
+			{
+				const UINT32 target = branch + (UINT32) displacement;
+				for (INT32 i = 0; i < span && i < 12; i++)
+				{
+					const UINT32 word = *(UINT32 *) &RAM[target + (UINT32) i * 4];
+					UINT32 reads, writes;
+					add(" %s%08X",
+					    ppc_spin_fields(word, &reads, &writes) ? "" : "!", word);
+				}
+			}
+			add(" [%08X]", op);
 		}
 	}
 
@@ -1410,10 +1436,23 @@ static PPCHandler ppc_decode(UINT32 opcode)
 	{
 		case 16:
 			// Relative, no link: the ordinary if and the ordinary loop.
+			//
+			// BO is 011zy to branch on a condition bit being set and 001zy to
+			// branch on it being clear, where z is reserved and y is the static
+			// prediction hint. Neither changes what the instruction does, and
+			// an interpreter has no pipeline to hint at, so all four values of
+			// each pair are the same branch and every one of them belongs
+			// here. Matching 01100 and 00100 exactly, as this did, sent every
+			// hinted branch a compiler emits to the general handler instead:
+			// beq- and bne+ are ordinary output, and on Spikeout the branch
+			// that closes the loop the game waits in is one of them. That put
+			// its waiting loop out of reach of the idle detector, which only
+			// ever sees the two shapes named here, and left the game running a
+			// hundred million instructions a second to sit still.
 			if (lk_aa == 0)
 			{
-				if (bo == 0x0c)		return ppc_bc_true;
-				if (bo == 0x04)		return ppc_bc_false;
+				if ((bo & 0x1c) == 0x0c)	return ppc_bc_true;
+				if ((bo & 0x1c) == 0x04)	return ppc_bc_false;
 			}
 			return optable[16];
 		case 19:
@@ -1474,16 +1513,20 @@ static void ppc_decode_stub(UINT32 op)
 			const bool want = handler == ppc_bc_true;
 			if (ppc_spin_loop(address, conditional, &why))
 				handler = want ? ppc_bc_true_idle : ppc_bc_false_idle;
-			else if (why != SPIN_WHY_RANGE)
+			else if (conditional < 0)
 			{
-				// It looked the part and failed on what is in it, so it is
-				// worth counting. A branch turned down for its range is any
-				// backward branch at all, and counting those says nothing.
+				// A backward branch is a loop, so every one this turns down is
+				// worth counting: the reason on its own says which rule was
+				// broken, and the count says whether the loop it was broken in
+				// is one the game spends its life in. Forward branches are
+				// left alone, being the ordinary if.
 				handler = want
-					? (why == SPIN_WHY_OP ? ppc_bc_watch_t<true, SPIN_WHY_OP>
-					                      : ppc_bc_watch_t<true, SPIN_WHY_DEP>)
-					: (why == SPIN_WHY_OP ? ppc_bc_watch_t<false, SPIN_WHY_OP>
-					                      : ppc_bc_watch_t<false, SPIN_WHY_DEP>);
+					? (why == SPIN_WHY_RANGE ? ppc_bc_watch_t<true, SPIN_WHY_RANGE>
+					 : why == SPIN_WHY_OP    ? ppc_bc_watch_t<true, SPIN_WHY_OP>
+					                         : ppc_bc_watch_t<true, SPIN_WHY_DEP>)
+					: (why == SPIN_WHY_RANGE ? ppc_bc_watch_t<false, SPIN_WHY_RANGE>
+					 : why == SPIN_WHY_OP    ? ppc_bc_watch_t<false, SPIN_WHY_OP>
+					                         : ppc_bc_watch_t<false, SPIN_WHY_DEP>);
 			}
 		}
 		else if ((op >> 26) == 18 && (op & 0x3) == 0)
