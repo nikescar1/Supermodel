@@ -286,6 +286,9 @@ typedef struct {
 	UINT32 spin_pc;
 	int spin_icount;
 	UINT64 spin_bus;
+	// How many instructions the last pass round the loop took, for a body
+	// whose paths are not all the same length. See ppc_note_spin_span.
+	UINT32 spin_interval;
 	// How many instructions have been skipped rather than executed, and how
 	// many were executed, so the two can be reported against each other.
 	UINT64 spin_skipped;
@@ -462,6 +465,30 @@ void ppc_set_idle_skip_timers(bool enabled)
 // to reach as far.
 #define PPC_SPIN_MAX	8
 
+// And the longest the other form will look at. A body this size is not a poll,
+// it is a routine; allowing one is a bet that the routine only reads, which
+// the analysis checks but which is a larger claim than the short form makes.
+#define PPC_SPIN_LONG_MAX	32
+
+// Whichever of the two is in force, which is also how far a store into a code
+// page has to reach when it throws decoded instructions away: a branch holds a
+// decision made by reading the instructions in front of it, so writing one of
+// them has to throw the branch away too.
+static UINT32	SpinMax = PPC_SPIN_MAX;
+
+// Whether the longer form is allowed at all. Off by default and not because
+// the analysis is unsound: a body of two instructions that only reads is a
+// thing anyone can check by eye, and a body of thirty-two with branches
+// through it is a thing this program checks and nobody else does. The short
+// form has been right in every game tried; this one is new.
+static bool	IdleSkipLong = false;
+
+void ppc_set_idle_skip_long(bool enabled)
+{
+	IdleSkipLong = enabled;
+	SpinMax = enabled ? PPC_SPIN_LONG_MAX : PPC_SPIN_MAX;
+}
+
 static UINT8	*ROM = NULL;
 
 /*
@@ -531,12 +558,12 @@ static UINT32		CodePageMask = 0;
 //
 // One entry would be enough if every entry described only its own word, but a
 // branch that closes a waiting loop holds a decision made by reading the
-// instructions in front of it, and those are at most PPC_SPIN_MAX words back.
+// instructions in front of it, and those are at most SpinMax words back.
 // So writing one of them has to throw the branch away as well. Outlined
 // because the caller's fast path is the test above it, not this.
 static PPC_NOINLINE void ppc_invalidate_window(UINT32 first)
 {
-	UINT32 last = first + PPC_SPIN_MAX;
+	UINT32 last = first + SpinMax;
 	if (last >= DecEntries)
 		last = DecEntries - 1;
 	for (UINT32 i = first; i <= last; i++)
@@ -1116,14 +1143,36 @@ void ppc_op_histogram(UINT32 *primary, UINT32 *ext31)
  * The other half is at run time, and is in ppc_note_spin.
  */
 
-// Whether one instruction may appear in the body of a waiting loop, and which
-// registers it reads and writes if it may.
-static bool ppc_spin_fields(UINT32 op, UINT32 *reads, UINT32 *writes)
+/*
+ * What a body instruction touches, in one integer.
+ *
+ * Not only the general registers. The rule that makes this work is that every
+ * register the body reads and also writes must be written before it is read,
+ * and with branches allowed inside the body the condition register and the
+ * carry are read and written exactly like any other: a branch reads a
+ * condition field, a compare writes one, and adde reads the carry that addic
+ * wrote. Leaving them out was safe only while the sole reader of a condition
+ * field was the branch that ends the loop.
+ */
+static const UINT64 kSpinCarry = 1ull << 40;
+
+static inline UINT64 SpinCr(UINT32 field)
+{
+	return 1ull << (32 + (field & 7));
+}
+
+// Whether one instruction may appear in the body of a waiting loop, and what
+// it reads and writes if it may. `branch_ok` allows the conditional branches
+// that only the longer form of the analysis knows what to do with.
+static bool ppc_spin_fields(UINT32 op, UINT64 *reads, UINT64 *writes,
+                            bool branch_ok)
 {
 	const UINT32 primary = op >> 26;
 	const UINT32 ra = (op >> 16) & 0x1f;
 	const UINT32 rs = (op >> 21) & 0x1f;	// also RT, and RD
 	const UINT32 rb = (op >> 11) & 0x1f;
+	const UINT32 crf_d = (op >> 23) & 7;
+	const bool rc = (op & 1) != 0;
 
 	*reads = 0;
 	*writes = 0;
@@ -1137,26 +1186,52 @@ static bool ppc_spin_fields(UINT32 op, UINT32 *reads, UINT32 *writes)
 		// addi and addis have the same shape and the same rule about a base of
 		// zero, and they are how a loop walks a pointer or forms a constant.
 		// Neither touches the carry, which is what keeps them here and keeps
-		// addic out.
+		// addic below in its own case.
 		case 32: case 34: case 40: case 42: case 14: case 15:
-			*reads = (ra != 0) ? (1u << ra) : 0;
-			*writes = 1u << rs;
+			*reads = (ra != 0) ? (1ull << ra) : 0;
+			*writes = 1ull << rs;
 			return true;
 
-		// Compares against an immediate. These write a condition field and no
-		// register at all, and a condition field is only ever read by the
-		// branch that ends the loop.
+		// addic, addic. and subfic, which are the same shape again and write
+		// the carry as well. A loop doing arithmetic wider than a register is
+		// built out of these and the carry-reading forms below.
+		case 12: case 13: case 8:
+			*reads = 1ull << ra;
+			*writes = (1ull << rs) | kSpinCarry |
+			          (primary == 13 ? SpinCr(0) : 0);
+			return true;
+
+		// Compares against an immediate.
 		case 10: case 11:
-			*reads = 1u << ra;
+			*reads = 1ull << ra;
+			*writes = SpinCr(crf_d);
 			return true;
 
 		// The D-form logicals and the rotate, whose destination is at 16 and
 		// whose source is at 21. The other way round from a load, which is
 		// worth saying because getting it backwards would let a loop through
-		// that writes what it reads.
+		// that writes what it reads. andi. and andis. always write a condition
+		// field; rlwinm does when it says so.
 		case 21: case 24: case 25: case 26: case 27: case 28: case 29:
-			*reads = 1u << rs;
-			*writes = 1u << ra;
+			*reads = 1ull << rs;
+			*writes = (1ull << ra) |
+			          ((primary == 28 || primary == 29 ||
+			            (primary == 21 && rc)) ? SpinCr(0) : 0);
+			return true;
+
+		// A conditional branch inside the body, which the caller has to place
+		// before it can be allowed: it decides which instructions after it are
+		// reached and which are not. Link and absolute forms are not branches
+		// inside a loop, they are calls and jumps out of one.
+		case 16:
+			if (!branch_ok || (op & 3) != 0)
+				return false;
+			// The BO forms that look at the count register decrement it, which
+			// is a write to something this does not model and a loop that ends
+			// on its own besides.
+			if (((op >> 21) & 0x14) != 0x04 && ((op >> 21) & 0x14) != 0x14)
+				return false;
+			*reads = SpinCr(((op >> 16) & 0x1f) >> 2);
 			return true;
 
 		case 31:
@@ -1164,28 +1239,69 @@ static bool ppc_spin_fields(UINT32 op, UINT32 *reads, UINT32 *writes)
 			{
 				// Compares.
 				case 0: case 32:
-					*reads = (1u << ra) | (1u << rb);
+					*reads = (1ull << ra) | (1ull << rb);
+					*writes = SpinCr(crf_d);
 					return true;
 
 				// The indexed loads.
 				case 23: case 87: case 279: case 343:
-					*reads = ((ra != 0) ? (1u << ra) : 0) | (1u << rb);
-					*writes = 1u << rs;
+					*reads = ((ra != 0) ? (1ull << ra) : 0) | (1ull << rb);
+					*writes = 1ull << rs;
 					return true;
 
-				// Register to register logic and shifts: and, andc, nor, or,
-				// orc, xor, nand, slw, srw, sraw.
+				// Register to register logic and shifts: and, andc, nor, eqv,
+				// orc, or, nand, xor, slw, srw, sraw.
 				case 28: case 60: case 124: case 284: case 412: case 444:
-				case 476: case 24: case 536: case 792:
-					*reads = (1u << rs) | (1u << rb);
-					*writes = 1u << ra;
+				case 476: case 316: case 24: case 536: case 792:
+					*reads = (1ull << rs) | (1ull << rb);
+					*writes = (1ull << ra) | (rc ? SpinCr(0) : 0);
+					// sraw writes the carry as well, which is the one of these
+					// that does.
+					if (((op >> 1) & 0x3ff) == 792)
+						*writes |= kSpinCarry;
 					return true;
 
 				// The ones with no second register: srawi, extsh, extsb,
 				// cntlzw.
 				case 824: case 922: case 954: case 26:
-					*reads = 1u << rs;
-					*writes = 1u << ra;
+					*reads = 1ull << rs;
+					*writes = (1ull << ra) | (rc ? SpinCr(0) : 0);
+					if (((op >> 1) & 0x3ff) == 824)
+						*writes |= kSpinCarry;
+					return true;
+
+				// Arithmetic on two registers, writing the field at 21. The
+				// overflow forms are absent: they write a summary bit this
+				// does not model, and no compiler emits them here.
+				case 266: case 40: case 235: case 75: case 11:
+					*reads = (1ull << ra) | (1ull << rb);
+					*writes = (1ull << rs) | (rc ? SpinCr(0) : 0);
+					return true;
+
+				// neg, which has no second register.
+				case 104:
+					*reads = 1ull << ra;
+					*writes = (1ull << rs) | (rc ? SpinCr(0) : 0);
+					return true;
+
+				// The carry-writing pair, addc and subfc.
+				case 10: case 8:
+					*reads = (1ull << ra) | (1ull << rb);
+					*writes = (1ull << rs) | kSpinCarry |
+					          (rc ? SpinCr(0) : 0);
+					return true;
+
+				// The carry-reading ones: adde, subfe, and the forms that take
+				// their second operand from the carry alone.
+				case 138: case 136:
+					*reads = (1ull << ra) | (1ull << rb) | kSpinCarry;
+					*writes = (1ull << rs) | kSpinCarry |
+					          (rc ? SpinCr(0) : 0);
+					return true;
+				case 202: case 200: case 234: case 232:
+					*reads = (1ull << ra) | kSpinCarry;
+					*writes = (1ull << rs) | kSpinCarry |
+					          (rc ? SpinCr(0) : 0);
 					return true;
 
 				// mfspr, which is how a game waits on the decrementer.
@@ -1217,7 +1333,7 @@ static bool ppc_spin_fields(UINT32 op, UINT32 *reads, UINT32 *writes)
 					const UINT32 spr = ((field & 0x1f) << 5) | (field >> 5);
 					if (spr == SPR603E_TBL_R || spr == SPR603E_TBU_R)
 						return false;
-					*writes = 1u << rs;
+					*writes = 1ull << rs;
 					return true;
 				}
 			}
@@ -1261,7 +1377,7 @@ static bool ppc_spin_loop(UINT32 address, INT32 displacement, SpinWhy *why)
 	*why = SPIN_WHY_RANGE;
 
 	// Backwards, and to somewhere this can read.
-	if (displacement >= 0 || displacement < -(PPC_SPIN_MAX * 4))
+	if (displacement >= 0 || displacement < -((INT32) SpinMax * 4))
 		return false;
 	const UINT32 span = (UINT32) (-displacement) >> 2;
 	const UINT32 target = address + (UINT32) displacement;
@@ -1271,13 +1387,19 @@ static bool ppc_spin_loop(UINT32 address, INT32 displacement, SpinWhy *why)
 	// The body is the `span` instructions from the target up to the branch,
 	// which sits at target + span * 4, where this started. Read straight out
 	// of RAM: Supermodel keeps it in the order the interpreter fetches it.
-	UINT32 reads[PPC_SPIN_MAX];
-	UINT32 writes[PPC_SPIN_MAX];
-	UINT32 clobbered = 0;
+	UINT64 reads[PPC_SPIN_LONG_MAX];
+	UINT64 writes[PPC_SPIN_LONG_MAX];
+	// Whether each instruction is reached every time round, or only when a
+	// branch above it did not jump over it. Only the first kind may be counted
+	// as having written anything: an instruction that is sometimes skipped
+	// cannot be relied on to have run.
+	bool always[PPC_SPIN_LONG_MAX];
+	UINT64 clobbered = 0;
 	for (UINT32 i = 0; i < span; i++)
 	{
+		always[i] = true;
 		UINT32 word = *(UINT32 *) &RAM[target + i * 4];
-		if (!ppc_spin_fields(word, &reads[i], &writes[i]))
+		if (!ppc_spin_fields(word, &reads[i], &writes[i], IdleSkipLong))
 		{
 			*why = SPIN_WHY_OP;
 			return false;
@@ -1285,9 +1407,29 @@ static bool ppc_spin_loop(UINT32 address, INT32 displacement, SpinWhy *why)
 		clobbered |= writes[i];
 	}
 
+	// Where each branch inside the body lands, and so which instructions it
+	// may jump over. Forward and inside the body only: a backward one is an
+	// inner loop, whose length varies from one pass to the next, and the whole
+	// run-time test rests on the length not varying.
+	for (UINT32 i = 0; i < span; i++)
+	{
+		UINT32 word = *(UINT32 *) &RAM[target + i * 4];
+		if ((word >> 26) != 16)
+			continue;
+		const INT32 jump = (INT32)(INT16)(word & 0xffff) & ~0x3;
+		const INT32 to = (INT32) i + (jump >> 2);
+		if (to <= (INT32) i || to > (INT32) span)
+		{
+			*why = SPIN_WHY_OP;
+			return false;
+		}
+		for (INT32 j = (INT32) i + 1; j < to; j++)
+			always[j] = false;
+	}
+
 	// Nothing may read a register the body writes before the body has written
 	// it. That is what makes every pass round the loop identical.
-	UINT32 written = 0;
+	UINT64 written = 0;
 	for (UINT32 i = 0; i < span; i++)
 	{
 		if (reads[i] & clobbered & ~written)
@@ -1295,9 +1437,25 @@ static bool ppc_spin_loop(UINT32 address, INT32 displacement, SpinWhy *why)
 			*why = SPIN_WHY_DEP;
 			return false;
 		}
-		written |= writes[i];
+		if (always[i])
+			written |= writes[i];
 	}
 	return true;
+}
+
+// Whether the body this branch closes holds a branch of its own, which is what
+// decides between the two run-time tests. Only called once, on a loop the
+// analysis has already accepted, so everything it reads is known good.
+static bool ppc_spin_body_branches(UINT32 address, INT32 displacement)
+{
+	const UINT32 span = (UINT32) (-displacement) >> 2;
+	const UINT32 target = address + (UINT32) displacement;
+	for (UINT32 i = 0; i < span; i++)
+	{
+		if ((*(UINT32 *) &RAM[target + i * 4] >> 26) == 16)
+			return true;
+	}
+	return false;
 }
 
 /*
@@ -1321,8 +1479,21 @@ static bool ppc_spin_loop(UINT32 address, INT32 displacement, SpinWhy *why)
  * The stop is one above the count the loop is running down to, because the
  * loop decrements once more before testing.
  */
-static inline void ppc_note_spin_span(UINT32 span)
+static inline void ppc_note_spin_span(UINT32 span, bool exact)
 {
+	// How many instructions since the last time this branch was taken. With a
+	// straight body that is the body and the branch, every time. With branches
+	// inside it, it is however many the path taken this time held, so the test
+	// becomes that it matched the time before and did not exceed the whole
+	// body: two passes of identical length over a body that cannot affect
+	// anything outside itself is the same evidence, arrived at once further
+	// round.
+	const UINT32 interval = (UINT32) (ppc.spin_icount - ppc.icount);
+	const bool length_ok = exact ? interval == span + 1
+	                             : (interval == ppc.spin_interval &&
+	                                interval <= span + 1);
+	ppc.spin_interval = interval;
+
 	// The body and the branch itself, which is why it is one more than the
 	// distance the branch jumps. Written as four tallies rather than one
 	// condition so that a loop which is never skipped says which test it
@@ -1331,7 +1502,7 @@ static inline void ppc_note_spin_span(UINT32 span)
 		SpinMissHits[0]++;
 	else if (ppc.spin_bus != BusTouches)
 		SpinMissHits[1]++;
-	else if ((UINT32) (ppc.spin_icount - ppc.icount) != span + 1)
+	else if (!length_ok)
 		SpinMissHits[2]++;
 	else if (ppc.icount <= ppc.icount_stop + 1)
 		SpinMissHits[3]++;
@@ -1348,9 +1519,10 @@ static inline void ppc_note_spin_span(UINT32 span)
 }
 
 // The conditional form, whose jump is the sixteen bit field.
-static inline void ppc_note_spin(UINT32 op)
+static inline void ppc_note_spin(UINT32 op, bool exact)
 {
-	ppc_note_spin_span((UINT32) (-(((INT32)(INT16)(op & 0xffff)) & ~0x3)) >> 2);
+	ppc_note_spin_span((UINT32) (-(((INT32)(INT16)(op & 0xffff)) & ~0x3)) >> 2,
+	                   exact);
 }
 
 // How many instructions were skipped rather than executed. Against the two
@@ -1435,9 +1607,10 @@ void ppc_idle_report(char *out, size_t size)
 				for (INT32 i = 0; i < span && i < 12; i++)
 				{
 					const UINT32 word = *(UINT32 *) &RAM[target + (UINT32) i * 4];
-					UINT32 reads, writes;
+					UINT64 reads, writes;
 					add(" %s%08X",
-					    ppc_spin_fields(word, &reads, &writes) ? "" : "!", word);
+					    ppc_spin_fields(word, &reads, &writes, IdleSkipLong)
+					        ? "" : "!", word);
 				}
 			}
 			add(" [%08X]", op);
@@ -1452,8 +1625,7 @@ void ppc_idle_report(char *out, size_t size)
 // The branch shapes that are worth a handler of their own. See ppc_ops.c.
 static void ppc_bc_true(UINT32 op);
 static void ppc_bc_false(UINT32 op);
-static void ppc_bc_true_idle(UINT32 op);
-static void ppc_bc_false_idle(UINT32 op);
+template <bool kWant, bool kExact> static void ppc_bc_idle_t(UINT32 op);
 // The pair again for a loop the analysis turned down, which behave exactly
 // like the plain ones and keep a tally besides. See ppc_idle_report.
 template <bool want, SpinWhy why> static void ppc_bc_watch_t(UINT32 op);
@@ -1557,7 +1729,20 @@ static void ppc_decode_stub(UINT32 op)
 		{
 			const bool want = handler == ppc_bc_true;
 			if (ppc_spin_loop(address, conditional, &why))
-				handler = want ? ppc_bc_true_idle : ppc_bc_false_idle;
+			{
+				// Whether every pass round this loop is the same length,
+				// which it is unless the body has branches to take a
+				// different path through. The run-time test differs, so the
+				// answer is baked into the handler here rather than worked out
+				// each time the branch runs.
+				const bool exact =
+				    !ppc_spin_body_branches(address, conditional);
+				handler = want
+					? (exact ? ppc_bc_idle_t<true, true>
+					         : ppc_bc_idle_t<true, false>)
+					: (exact ? ppc_bc_idle_t<false, true>
+					         : ppc_bc_idle_t<false, false>);
+			}
 			else if (conditional < 0)
 			{
 				// A backward branch is a loop, so every one this turns down is

@@ -398,6 +398,13 @@ extern void ppc_set_idle_skip(bool enabled);
 // when it takes effect.
 extern void ppc_set_idle_skip_timers(bool enabled);
 
+// Whether a waiting loop may be up to thirty-two instructions long and have
+// branches inside it, rather than eight and none. Off unless turned on: the
+// analysis is the same argument either way, but a body that size is a routine
+// rather than a poll, and letting one through is a larger claim. Same caveat
+// as above about when it takes effect.
+extern void ppc_set_idle_skip_long(bool enabled);
+
 // How many instructions were skipped rather than executed, because the
 // processor was in a loop that could not end before its slice did. See
 // ppc_note_spin in ppc.cpp.

@@ -360,21 +360,19 @@ static void ppc_bc_false(UINT32 op)
 // The same two again, for loops that were shown at decode time to be waiting
 // rather than working. Identical but for the one call, which is what decides
 // whether the rest of the slice is executed or handed to the clock.
-static void ppc_bc_true_idle(UINT32 op)
+//
+// `kExact` says whether every pass round this loop runs the same instructions.
+// A body with no branches in it does; one with branches in it runs whichever
+// path the conditions chose, so the run-time test has to compare this pass
+// against the last rather than against the body's length. A template argument
+// rather than a test, because the answer was settled when the branch was
+// decoded and is the same every time it runs.
+template <bool kWant, bool kExact>
+static void ppc_bc_idle_t(UINT32 op)
 {
-	if (CRBIT(BI))
+	if ((CRBIT(BI) != 0) == kWant)
 	{
-		ppc_note_spin(op);
-		ppc.npc = (SIMM16 & ~0x3) + ppc.pc;
-		ppc_change_pc(ppc.npc);
-	}
-}
-
-static void ppc_bc_false_idle(UINT32 op)
-{
-	if (!CRBIT(BI))
-	{
-		ppc_note_spin(op);
+		ppc_note_spin(op, kExact);
 		ppc.npc = (SIMM16 & ~0x3) + ppc.pc;
 		ppc_change_pc(ppc.npc);
 	}
@@ -410,7 +408,8 @@ static void ppc_b_idle(UINT32 op)
 	if (li & 0x2000000)
 		li |= (INT32) 0xfc000000;
 
-	ppc_note_spin_span((UINT32) (-li) >> 2);
+	// No branches to take a different path through, so the length is fixed.
+	ppc_note_spin_span((UINT32) (-li) >> 2, true);
 
 	ppc.npc = ppc.pc + (UINT32) li;
 	ppc_change_pc(ppc.npc);
