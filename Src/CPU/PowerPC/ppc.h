@@ -28,6 +28,8 @@
 #ifndef INCLUDED_PPC_H
 #define INCLUDED_PPC_H
 
+#include <cstddef>
+
 #include "BlockFile.h"
 #include "Types.h"
 #include "Debugger/CPU/PPCDebug.h"
@@ -393,6 +395,12 @@ extern void ppc_set_idle_skip(bool enabled);
 // processor was in a loop that could not end before its slice did. See
 // ppc_note_spin in ppc.cpp.
 extern void ppc_idle_skipped(UINT64 *skipped);
+
+// One line saying what the idle detector did with this interval, and, when a
+// loop that looked like a waiting one was turned down, which rule turned it
+// down and what the loop holds. Reading clears the tallies. See
+// ppc_idle_report in ppc.cpp; two hundred and fifty-six bytes is enough.
+extern void ppc_idle_report(char *out, size_t size);
 
 // Throws away every decoded instruction. For anything that replaces the
 // contents of main RAM behind the interpreter's back, which is a save state

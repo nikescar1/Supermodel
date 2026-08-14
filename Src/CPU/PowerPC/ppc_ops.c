@@ -380,6 +380,22 @@ static void ppc_bc_false_idle(UINT32 op)
 	}
 }
 
+// A short backward branch the analysis turned down. Identical to the plain
+// pair but for the two lines that record it, which is what tells a game with
+// no skipping at all from a game with nothing to skip. The reason is a
+// template argument so the count is a fixed address rather than a lookup.
+template <bool want, SpinWhy why>
+static void ppc_bc_watch_t(UINT32 op)
+{
+	if ((CRBIT(BI) != 0) == want)
+	{
+		SpinRejectHits[why]++;
+		SpinRejectPc[why] = ppc.pc;
+		ppc.npc = (SIMM16 & ~0x3) + ppc.pc;
+		ppc_change_pc(ppc.npc);
+	}
+}
+
 // An unconditional branch backwards over a body that only reads.
 //
 // This one has no exit at all: the branch always jumps, and the analysis has

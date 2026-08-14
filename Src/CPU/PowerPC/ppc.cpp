@@ -1122,7 +1122,11 @@ static bool ppc_spin_fields(UINT32 op, UINT32 *reads, UINT32 *writes)
 		// base is the one at 16. A base of zero means no base, not r0. The
 		// update forms are absent on purpose: they write the base as well,
 		// which is exactly the thing this is trying to rule out.
-		case 32: case 34: case 40: case 42:
+		// addi and addis have the same shape and the same rule about a base of
+		// zero, and they are how a loop walks a pointer or forms a constant.
+		// Neither touches the carry, which is what keeps them here and keeps
+		// addic out.
+		case 32: case 34: case 40: case 42: case 14: case 15:
 			*reads = (ra != 0) ? (1u << ra) : 0;
 			*writes = 1u << rs;
 			return true;
@@ -1177,10 +1181,40 @@ static bool ppc_spin_fields(UINT32 op, UINT32 *reads, UINT32 *writes)
 	return false;
 }
 
-// Whether the conditional branch at `address` closes a loop that can only be
-// ended from outside. See above.
-static bool ppc_spin_loop(UINT32 address, INT32 displacement)
+/*
+ * Why a loop that looked like a waiting one was not taken to be one.
+ *
+ * A game that skips nothing when every other game skips half its budget is
+ * not a game without a waiting loop; it is a loop this rejected, and which of
+ * the tests rejected it is the whole question. Guessing at that from an
+ * instruction mix is how an afternoon goes. So each reason gets a counter,
+ * and the branches that were turned down get a handler that keeps count of
+ * how often they actually go round: a reason rejected once and never executed
+ * is noise, and a reason rejected once and executed a million times a second
+ * is the answer.
+ */
+enum SpinWhy
 {
+	SPIN_WHY_RANGE = 0,	// not backwards, too long, or not in RAM
+	SPIN_WHY_OP,		// the body holds something that is not a pure read
+	SPIN_WHY_DEP,		// the body reads a register it writes, so it moves on
+	SPIN_WHY_COUNT
+};
+
+// How often each rejected loop has closed, and the last one of each to do so.
+// Only ever written from the interpreter thread.
+static UINT64	SpinRejectHits[SPIN_WHY_COUNT];
+static UINT32	SpinRejectPc[SPIN_WHY_COUNT];
+// The same for the run-time half: which of its four tests said no.
+static UINT64	SpinMissHits[4];
+static UINT64	SpinHits;
+
+// Whether the conditional branch at `address` closes a loop that can only be
+// ended from outside. See above. `why` is filled in when the answer is no.
+static bool ppc_spin_loop(UINT32 address, INT32 displacement, SpinWhy *why)
+{
+	*why = SPIN_WHY_RANGE;
+
 	// Backwards, and to somewhere this can read.
 	if (displacement >= 0 || displacement < -(PPC_SPIN_MAX * 4))
 		return false;
@@ -1199,7 +1233,10 @@ static bool ppc_spin_loop(UINT32 address, INT32 displacement)
 	{
 		UINT32 word = *(UINT32 *) &RAM[target + i * 4];
 		if (!ppc_spin_fields(word, &reads[i], &writes[i]))
+		{
+			*why = SPIN_WHY_OP;
 			return false;
+		}
 		clobbered |= writes[i];
 	}
 
@@ -1209,7 +1246,10 @@ static bool ppc_spin_loop(UINT32 address, INT32 displacement)
 	for (UINT32 i = 0; i < span; i++)
 	{
 		if (reads[i] & clobbered & ~written)
+		{
+			*why = SPIN_WHY_DEP;
 			return false;
+		}
 		written |= writes[i];
 	}
 	return true;
@@ -1239,12 +1279,20 @@ static bool ppc_spin_loop(UINT32 address, INT32 displacement)
 static inline void ppc_note_spin_span(UINT32 span)
 {
 	// The body and the branch itself, which is why it is one more than the
-	// distance the branch jumps.
-	if (ppc.spin_pc == ppc.pc &&
-	    ppc.spin_bus == BusTouches &&
-	    (UINT32) (ppc.spin_icount - ppc.icount) == span + 1 &&
-	    ppc.icount > ppc.icount_stop + 1)
+	// distance the branch jumps. Written as four tallies rather than one
+	// condition so that a loop which is never skipped says which test it
+	// fails, which is the only question worth asking about one.
+	if (ppc.spin_pc != ppc.pc)
+		SpinMissHits[0]++;
+	else if (ppc.spin_bus != BusTouches)
+		SpinMissHits[1]++;
+	else if ((UINT32) (ppc.spin_icount - ppc.icount) != span + 1)
+		SpinMissHits[2]++;
+	else if (ppc.icount <= ppc.icount_stop + 1)
+		SpinMissHits[3]++;
+	else
 	{
+		SpinHits++;
 		ppc.spin_skipped += (UINT64) (ppc.icount - (ppc.icount_stop + 1));
 		ppc.icount = ppc.icount_stop + 1;
 	}
@@ -1268,11 +1316,76 @@ void ppc_idle_skipped(UINT64 *skipped)
 	*skipped = ppc.spin_skipped;
 }
 
+/*
+ * One line saying why a game is not skipping its waiting loop.
+ *
+ * Built here rather than by the caller because everything it needs is here:
+ * the tallies, and the RAM the loop is in. The busiest rejection wins, and
+ * the loop it names is dumped word for word, because the reason on its own
+ * says which rule was broken and not which instruction broke it.
+ *
+ * Reading clears the tallies, so each line describes the interval before it.
+ * A game that has settled into a loop it cannot skip prints the same line
+ * every second, which is exactly the shape the problem has.
+ */
+void ppc_idle_report(char *out, size_t size)
+{
+	static const char *const kWhy[SPIN_WHY_COUNT] =
+		{ "not-in-ram", "body-op", "body-writes-what-it-reads" };
+	static const char *const kMiss[4] =
+		{ "other-branch", "bus-touched", "wrong-count", "slice-over" };
+
+	int at = snprintf(out, size, "idle: skipped %llu",
+	                  (unsigned long long) SpinHits);
+	for (int i = 0; i < 4; i++)
+	{
+		if (SpinMissHits[i] != 0)
+			at += snprintf(out + at, size - at, " %s %llu", kMiss[i],
+			               (unsigned long long) SpinMissHits[i]);
+	}
+
+	// Whichever rejected loop went round most is the one worth naming.
+	int worst = -1;
+	for (int i = 0; i < SPIN_WHY_COUNT; i++)
+	{
+		if (SpinRejectHits[i] != 0 &&
+		    (worst < 0 || SpinRejectHits[i] > SpinRejectHits[worst]))
+			worst = i;
+	}
+	if (worst >= 0)
+	{
+		// The recorded address is the one after the branch, which is what the
+		// interpreter has in hand when it takes it.
+		const UINT32 branch = SpinRejectPc[worst] - 4;
+		at += snprintf(out + at, size - at, " | rejected %s %llu at %08X",
+		               kWhy[worst], (unsigned long long) SpinRejectHits[worst],
+		               branch);
+		if (branch < RAMSize && branch >= PPC_SPIN_MAX * 4)
+		{
+			const UINT32 op = *(UINT32 *) &RAM[branch];
+			INT32 displacement = (INT32)(INT16)(op & 0xffff) & ~0x3;
+			UINT32 span = (displacement < 0 && displacement >= -(PPC_SPIN_MAX * 4))
+			              ? (UINT32) (-displacement) >> 2 : 0;
+			for (UINT32 i = 0; i < span && at < (int) size - 16; i++)
+				at += snprintf(out + at, size - at, " %08X",
+				               *(UINT32 *) &RAM[branch + (UINT32)displacement + i * 4]);
+			at += snprintf(out + at, size - at, " [%08X]", op);
+		}
+	}
+
+	memset(SpinRejectHits, 0, sizeof(SpinRejectHits));
+	memset(SpinMissHits, 0, sizeof(SpinMissHits));
+	SpinHits = 0;
+}
+
 // The branch shapes that are worth a handler of their own. See ppc_ops.c.
 static void ppc_bc_true(UINT32 op);
 static void ppc_bc_false(UINT32 op);
 static void ppc_bc_true_idle(UINT32 op);
 static void ppc_bc_false_idle(UINT32 op);
+// The pair again for a loop the analysis turned down, which behave exactly
+// like the plain ones and keep a tally besides. See ppc_idle_report.
+template <bool want, SpinWhy why> static void ppc_bc_watch_t(UINT32 op);
 static void ppc_b_idle(UINT32 op);
 
 // The arithmetic and logic worth settling RC and OE for. See ppc_ops.c.
@@ -1355,10 +1468,24 @@ static void ppc_decode_stub(UINT32 op)
 	{
 		// The conditional forms, whose jump is the sixteen bit field.
 		const INT32 conditional = (INT32)(INT16)(op & 0xffff) & ~0x3;
-		if (handler == ppc_bc_true && ppc_spin_loop(address, conditional))
-			handler = ppc_bc_true_idle;
-		else if (handler == ppc_bc_false && ppc_spin_loop(address, conditional))
-			handler = ppc_bc_false_idle;
+		SpinWhy why = SPIN_WHY_RANGE;
+		if (handler == ppc_bc_true || handler == ppc_bc_false)
+		{
+			const bool want = handler == ppc_bc_true;
+			if (ppc_spin_loop(address, conditional, &why))
+				handler = want ? ppc_bc_true_idle : ppc_bc_false_idle;
+			else if (why != SPIN_WHY_RANGE)
+			{
+				// It looked the part and failed on what is in it, so it is
+				// worth counting. A branch turned down for its range is any
+				// backward branch at all, and counting those says nothing.
+				handler = want
+					? (why == SPIN_WHY_OP ? ppc_bc_watch_t<true, SPIN_WHY_OP>
+					                      : ppc_bc_watch_t<true, SPIN_WHY_DEP>)
+					: (why == SPIN_WHY_OP ? ppc_bc_watch_t<false, SPIN_WHY_OP>
+					                      : ppc_bc_watch_t<false, SPIN_WHY_DEP>);
+			}
+		}
 		else if ((op >> 26) == 18 && (op & 0x3) == 0)
 		{
 			// A branch that always jumps backwards over a body doing nothing
@@ -1370,7 +1497,7 @@ static void ppc_decode_stub(UINT32 op)
 			INT32 li = (INT32) (op & 0x3fffffc);
 			if (li & 0x2000000)
 				li |= (INT32) 0xfc000000;
-			if (ppc_spin_loop(address, li))
+			if (ppc_spin_loop(address, li, &why))
 				handler = ppc_b_idle;
 		}
 	}
